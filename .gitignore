@@ -1,0 +1,15 @@
+target/
+bin/
+obj/
+.vs/
+*.user
+OpenPaper/
+WallpaperClient/publish/
+*.png
+wallpaper_core/*.dll
+wallpaper_core/*.exe
+wallpaper_core/*.json
+wallpaper_core/*.pdb
+wallpaper_core/libvlc/
+wallpaper_core/[a-z][a-z]/
+птички 1 (2).6

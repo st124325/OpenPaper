@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>OpenPaper</AssemblyName>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- LGPL runtime loaded by wallpaper_core at runtime; no LibVLCSharp wrapper is used. -->
+    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.23.1" />
+  </ItemGroup>
+  <Target Name="BuildRustCore" BeforeTargets="Build">
+    <Exec Command="cargo build --manifest-path &quot;..\wallpaper_core\Cargo.toml&quot; --release" />
+    <Copy SourceFiles="..\wallpaper_core\target\release\wallpaper_core.dll"
+          DestinationFolder="$(OutDir)" />
+  </Target>
+  <Target Name="CopyRustCoreToPublish" AfterTargets="Publish">
+    <Copy SourceFiles="..\wallpaper_core\target\release\wallpaper_core.dll"
+          DestinationFolder="$(PublishDir)" />
+  </Target>
+</Project>
