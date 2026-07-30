@@ -12,6 +12,7 @@ public partial class MainWindow : Window
     private AppSettings _settings = new();
     private bool _loading;
     private bool _muted;
+    private bool _syncingVolume;
     private int _lastVolume = 70;
 
     public MainWindow()
@@ -144,7 +145,20 @@ public partial class MainWindow : Window
     {
         if (sender is not Border card || card.DataContext is not WallpaperCard item || !item.IsVideo) return;
         var player = FindChild<MediaElement>(card);
-        if (player is not null) { player.Position = TimeSpan.Zero; player.Play(); }
+        if (player is not null)
+        {
+            player.Position = TimeSpan.Zero; player.Play();
+            if (item.ThumbnailUri is null)
+            {
+                var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
+                timer.Tick += (_, _) =>
+                {
+                    timer.Stop();
+                    if (ThumbnailCache.Save(player, item.Path!)) RefreshLibrary(item.Path);
+                };
+                timer.Start();
+            }
+        }
     }
     private void CardPreviewLeave(object sender, System.Windows.Input.MouseEventArgs e)
     {
@@ -189,7 +203,7 @@ public partial class MainWindow : Window
     private void VolumeChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
         VolumeValueText.Text = ((int)e.NewValue).ToString();
-        if (_loading) return;
+        if (_loading || _syncingVolume) return;
         var volume = (int)e.NewValue;
         if (volume == 0) _muted = true;
         else { _muted = false; _lastVolume = volume; }
@@ -200,7 +214,14 @@ public partial class MainWindow : Window
     private void Mute_Click(object sender, RoutedEventArgs e)
     {
         if (!_muted && VolumeSlider.Value > 0) _lastVolume = (int)VolumeSlider.Value;
-        VolumeSlider.Value = _muted ? Math.Max(1, _lastVolume) : 0;
+        SetVolume(_muted ? Math.Max(1, _lastVolume) : 0);
+    }
+    private void SetVolume(int volume)
+    {
+        _syncingVolume = true;
+        VolumeSlider.Value = Math.Clamp(volume, 0, 100);
+        _syncingVolume = false;
+        VolumeChanged(this, new RoutedPropertyChangedEventArgs<double>(0, VolumeSlider.Value));
     }
     private void OtherAppsMuteChanged(object sender, RoutedEventArgs e)
     {
@@ -238,6 +259,7 @@ public partial class MainWindow : Window
         public string FileName => Path is null ? "Windows" : System.IO.Path.GetFileName(Path);
         public string Extension => Path is null ? "OFF" : System.IO.Path.GetExtension(Path).TrimStart('.').ToUpperInvariant();
         public Uri? PreviewUri => Path is null ? null : new Uri(Path, UriKind.Absolute);
+        public Uri? ThumbnailUri => ThumbnailCache.Get(Path);
         public string PreviewSymbol => Path is null ? "×" : "▶";
         public bool IsVideo => string.Equals(Extension, "MP4", StringComparison.OrdinalIgnoreCase);
     }
