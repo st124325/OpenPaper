@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Net.Http;
 using System.Text.Json;
 using System.Windows;
@@ -20,12 +19,9 @@ internal static class UpdateChecker
             var tag = document.RootElement.GetProperty("tag_name").GetString()?.TrimStart('v');
             var current = typeof(UpdateChecker).Assembly.GetName().Version?.ToString(3);
             var page = document.RootElement.GetProperty("html_url").GetString();
+            var notes = document.RootElement.TryGetProperty("body", out var body) ? body.GetString() : null;
             if (string.IsNullOrWhiteSpace(tag) || string.IsNullOrWhiteSpace(page) || tag == current) return;
-            await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
-            {
-                if (System.Windows.MessageBox.Show($"Доступна версия {tag}. Открыть страницу обновления?", "OpenPaper", MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes)
-                    Process.Start(new ProcessStartInfo(page) { UseShellExecute = true });
-            });
+            await System.Windows.Application.Current.Dispatcher.InvokeAsync(() => new UpdateDialog(tag, page, notes).ShowDialog());
         }
         catch { /* Offline or no release: application works normally. */ }
     }
