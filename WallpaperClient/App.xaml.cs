@@ -15,6 +15,7 @@ public partial class App : System.Windows.Application
         Environment.SetEnvironmentVariable("OPENWALLPAPER_LIBVLC_DIR", vlcRuntime);
         base.OnStartup(e);
         CreateTrayIcon();
+        _ = UpdateChecker.CheckAsync();
     }
 
     internal void ShowMainWindow()
