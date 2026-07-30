@@ -20,7 +20,13 @@ jobs:
         run: dotnet publish WallpaperClient/WallpaperClient.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -o dist/OpenPaper-win-x64
       - name: Archive
         run: Compress-Archive -Path dist/OpenPaper-win-x64/* -DestinationPath dist/OpenPaper-win-x64.zip
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        run: iscc installer/OpenPaper.iss
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/OpenPaper-win-x64.zip
+          files: |
+            dist/OpenPaper-win-x64.zip
+            dist/OpenPaper-Setup-win-x64.exe
