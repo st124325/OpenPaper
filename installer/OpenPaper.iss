@@ -1,5 +1,5 @@
 #define MyAppName "OpenPaper"
-#define MyAppVersion "1.0.1"
+#define MyAppVersion "1.0.2"
 #define MyAppPublisher "OpenPaper"
 #define MyAppExeName "OpenPaper.exe"
 
@@ -10,7 +10,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\OpenPaper
 DefaultGroupName=OpenPaper
-OutputDir=dist
+OutputDir=..\dist
 OutputBaseFilename=OpenPaper-Setup-win-x64
 Compression=lzma2
 SolidCompression=yes
@@ -19,7 +19,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-Source: "dist\OpenPaper-win-x64\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+Source: "..\dist\OpenPaper-win-x64\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
 [Icons]
 Name: "{autoprograms}\OpenPaper"; Filename: "{app}\{#MyAppExeName}"
