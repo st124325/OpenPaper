@@ -15,7 +15,11 @@ public partial class App : System.Windows.Application
         Environment.SetEnvironmentVariable("OPENWALLPAPER_LIBVLC_DIR", vlcRuntime);
         base.OnStartup(e);
         CreateTrayIcon();
-        _ = UpdateChecker.CheckAsync();
+        // Wait until StartupUri has created and displayed the main window.
+        // This keeps the update dialog from racing the WPF startup sequence.
+        Dispatcher.BeginInvoke(
+            async () => await UpdateChecker.CheckAsync(),
+            System.Windows.Threading.DispatcherPriority.ApplicationIdle);
     }
 
     internal void ShowMainWindow()
