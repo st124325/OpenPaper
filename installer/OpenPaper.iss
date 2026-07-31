@@ -1,5 +1,5 @@
 #define MyAppName "OpenPaper"
-#define MyAppVersion "0.0.2"
+#define MyAppVersion "0.0.3"
 #define MyAppPublisher "OpenPaper"
 #define MyAppExeName "OpenPaper.exe"
 
@@ -28,7 +28,7 @@ Name: "{autoprograms}\OpenPaper"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\OpenPaper"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Tasks]
-Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; Flags: unchecked
+Name: "desktopicon"; Description: "Create a desktop shortcut"
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Запустить OpenPaper"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch OpenPaper"; Flags: nowait postinstall skipifsilent

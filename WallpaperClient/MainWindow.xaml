@@ -1,7 +1,7 @@
 <Window x:Class="WallpaperClient.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="OpenPaper" Icon="../assets/OpenPaper.ico" Height="500" Width="720" MinWidth="460" MinHeight="390"
+        Title="OpenPaper" Height="500" Width="720" MinWidth="460" MinHeight="390"
         WindowStartupLocation="CenterScreen" Background="#F4F6F8" Foreground="#111111" FontFamily="Arial" SizeChanged="Window_SizeChanged">
     <Window.Resources>
         <Style TargetType="Button">
