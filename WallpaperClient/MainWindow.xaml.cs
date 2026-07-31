@@ -127,9 +127,14 @@ public partial class MainWindow : Window
         if (card.IsEmpty)
         {
             WallpaperEngineInterop.StopEngine();
+            if (!WallpaperEngineInterop.SetBlackDesktop())
+            {
+                SetStatus($"Could not set black background: {WallpaperEngineInterop.GetLastErrorMessage()}", "Не удалось установить чёрный фон.");
+                return;
+            }
             _settings = _settings with { WallpaperPath = null };
             _settingsStore.Save(_settings);
-            SetStatus("Wallpaper stopped.", "Обои отключены.");
+            SetStatus("Black background applied.", "Установлен чёрный фон.");
             return;
         }
         ApplyWallpaper(card.Path!, true);

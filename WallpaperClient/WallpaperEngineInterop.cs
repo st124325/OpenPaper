@@ -20,6 +20,10 @@ internal static partial class WallpaperEngineInterop
     [LibraryImport(LibraryName, EntryPoint = "stop_engine")]
     internal static partial void StopEngine();
 
+    [LibraryImport(LibraryName, EntryPoint = "set_black_desktop")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static partial bool SetBlackDesktop();
+
     [LibraryImport(LibraryName, EntryPoint = "set_muted")]
     [return: MarshalAs(UnmanagedType.I1)]
     internal static partial bool SetMuted([MarshalAs(UnmanagedType.I1)] bool muted);

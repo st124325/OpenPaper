@@ -17,9 +17,10 @@ use std::{
 use windows::{
     core::{w, PCWSTR},
     Win32::{
-        Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
-            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+            GetMonitorInfoW, MonitorFromWindow, SetSysColors, COLOR_DESKTOP, MONITORINFO,
+            MONITOR_DEFAULTTONEAREST,
         },
         System::{
             Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
@@ -343,6 +344,34 @@ pub extern "C" fn stop_engine() {
     if let Some(thread) = monitor {
         let _ = thread.join();
     }
+}
+
+/// Clears the static wallpaper and paints the desktop background solid black.
+/// This is intentionally separate from `stop_engine`: exiting OpenPaper must
+/// not unexpectedly alter a user's desktop, while selecting "No wallpaper" does.
+#[no_mangle]
+pub extern "C" fn set_black_desktop() -> bool {
+    let color_indexes = [COLOR_DESKTOP.0];
+    let black = [COLORREF(0)];
+    let color_result = unsafe { SetSysColors(1, color_indexes.as_ptr(), black.as_ptr()).is_ok() };
+    let wallpaper_result = unsafe {
+        SystemParametersInfoW(
+            SPI_SETDESKWALLPAPER,
+            0,
+            None,
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        )
+        .is_ok()
+    };
+
+    if let Ok(mut state) = engine().lock() {
+        if color_result && wallpaper_result {
+            state.last_error.clear();
+        } else {
+            state.last_error = "Could not set the desktop background to black.".into();
+        }
+    }
+    color_result && wallpaper_result
 }
 
 fn set_last_error(message: &str) {
