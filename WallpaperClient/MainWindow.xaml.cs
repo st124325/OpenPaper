@@ -69,7 +69,7 @@ public partial class MainWindow : Window
         SoundWaveInnerIcon.Visibility = _muted ? Visibility.Collapsed : Visibility.Visible;
         SoundWaveOuterIcon.Visibility = _muted || VolumeSlider.Value < 50 ? Visibility.Collapsed : Visibility.Visible;
         SoundMutedIcon.Visibility = _muted ? Visibility.Visible : Visibility.Collapsed;
-        VolumeValueText.Text = ((int)VolumeSlider.Value).ToString();
+        VolumeValueText.Text = $"{(int)VolumeSlider.Value}%";
         UpdateLanguagePill();
     }
 
