@@ -1,5 +1,5 @@
 #define MyAppName "OpenPaper"
-#define MyAppVersion "0.0.1"
+#define MyAppVersion "0.0.2"
 #define MyAppPublisher "OpenPaper"
 #define MyAppExeName "OpenPaper.exe"
 
@@ -8,6 +8,8 @@ AppId={{EAA5AA56-EE79-4BC5-9F77-8180C64E4370}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+SetupIconFile=..\assets\OpenPaper.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
 DefaultDirName={autopf}\OpenPaper
 DefaultGroupName=OpenPaper
 OutputDir=..\dist
