@@ -15,6 +15,7 @@ public partial class App : System.Windows.Application
         Environment.SetEnvironmentVariable("OPENWALLPAPER_LIBVLC_DIR", vlcRuntime);
         base.OnStartup(e);
         CreateTrayIcon();
+        UpdateChecker.UpdateReady += OnUpdateReady;
     }
 
     internal void ShowMainWindow()
@@ -44,12 +45,23 @@ public partial class App : System.Windows.Application
     private void ExitApplication()
     {
         IsExiting = true;
+        UpdateChecker.TryLaunchPendingInstaller();
         Shutdown();
+    }
+
+    private void OnUpdateReady(string version)
+    {
+        _trayIcon?.ShowBalloonTip(
+            4_000,
+            "OpenPaper",
+            $"Обновление {version} загружено и установится при выходе из приложения.",
+            Forms.ToolTipIcon.Info);
     }
 
     protected override void OnExit(ExitEventArgs e)
     {
         _trayIcon?.Dispose();
+        UpdateChecker.UpdateReady -= OnUpdateReady;
         WallpaperEngineInterop.StopEngine();
         base.OnExit(e);
     }

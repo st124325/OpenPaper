@@ -1,5 +1,5 @@
 #define MyAppName "OpenPaper"
-#define MyAppVersion "0.0.6"
+#define MyAppVersion "0.0.7"
 #define MyAppPublisher "OpenPaper"
 #define MyAppExeName "OpenPaper.exe"
 
@@ -10,7 +10,10 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 SetupIconFile=..\assets\OpenPaper.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
-DefaultDirName={autopf}\OpenPaper
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+DefaultDirName={localappdata}\OpenPaper
+UsePreviousAppDir=no
 DefaultGroupName=OpenPaper
 OutputDir=..\dist
 OutputBaseFilename=OpenPaper-Setup-win-x64
@@ -19,6 +22,7 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+CloseApplications=yes
 
 [Files]
 Source: "..\dist\OpenPaper-win-x64\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
@@ -31,4 +35,4 @@ Name: "{autodesktop}\OpenPaper"; Filename: "{app}\{#MyAppExeName}"; Tasks: deskt
 Name: "desktopicon"; Description: "Create a desktop shortcut"
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch OpenPaper"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch OpenPaper"; Flags: nowait
