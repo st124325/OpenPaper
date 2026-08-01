@@ -66,10 +66,9 @@ public partial class MainWindow : Window
             ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 224, 228))
             : new SolidColorBrush(System.Windows.Media.Color.FromRgb(20, 20, 20));
         MuteButton.Foreground = _muted ? System.Windows.Media.Brushes.Black : System.Windows.Media.Brushes.White;
-        SoundOnIcon.Visibility = _muted ? Visibility.Collapsed : Visibility.Visible;
-        SoundWaveInnerIcon.Visibility = _muted ? Visibility.Collapsed : Visibility.Visible;
-        SoundWaveOuterIcon.Visibility = _muted || VolumeSlider.Value < 50 ? Visibility.Collapsed : Visibility.Visible;
-        SoundMutedIcon.Visibility = _muted ? Visibility.Visible : Visibility.Collapsed;
+        AudioIconText.Text = _muted || VolumeSlider.Value == 0
+            ? "🔇"
+            : VolumeSlider.Value < 50 ? "🔉" : "🔊";
         VolumeValueText.Text = $"{(int)VolumeSlider.Value}%";
         UpdateLanguagePill();
     }

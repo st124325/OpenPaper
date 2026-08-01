@@ -7,6 +7,7 @@ namespace WallpaperClient;
 public partial class App : System.Windows.Application
 {
     private Forms.NotifyIcon? _trayIcon;
+    private System.Drawing.Icon? _trayIconImage;
     internal bool IsExiting { get; private set; }
 
     protected override void OnStartup(StartupEventArgs e)
@@ -32,10 +33,12 @@ public partial class App : System.Windows.Application
         var menu = new Forms.ContextMenuStrip();
         menu.Items.Add("Open", null, (_, _) => ShowMainWindow());
         menu.Items.Add("Exit", null, (_, _) => ExitApplication());
+        var executablePath = Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "OpenPaper.exe");
+        _trayIconImage = System.Drawing.Icon.ExtractAssociatedIcon(executablePath);
         _trayIcon = new Forms.NotifyIcon
         {
             Text = "OpenPaper",
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = _trayIconImage ?? System.Drawing.SystemIcons.Application,
             Visible = true,
             ContextMenuStrip = menu,
         };
@@ -61,6 +64,7 @@ public partial class App : System.Windows.Application
     protected override void OnExit(ExitEventArgs e)
     {
         _trayIcon?.Dispose();
+        _trayIconImage?.Dispose();
         UpdateChecker.UpdateReady -= OnUpdateReady;
         WallpaperEngineInterop.StopEngine();
         base.OnExit(e);
