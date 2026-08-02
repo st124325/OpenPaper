@@ -22,10 +22,10 @@ use windows::{
             Dxgi::IDXGIAdapter,
         },
         Media::MediaFoundation::{
-            IMFDXGIDeviceManager, IMFMediaSource, IMFMediaStream, IMFTransform, MEMediaSample,
-            MENewStream, MEStreamStarted, MFCreateDXGIDeviceManager, MFCreateSourceResolver,
-            MFMediaType_Video, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_HEVC,
-            MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
+            IMFDXGIDeviceManager, IMFMediaSource, IMFMediaStream, IMFPresentationDescriptor,
+            IMFTransform, MEMediaSample, MENewStream, MEStreamStarted, MFCreateDXGIDeviceManager,
+            MFCreateSourceResolver, MFMediaType_Video, MFTEnumEx, MFVideoFormat_H264,
+            MFVideoFormat_HEVC, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
             MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
             MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
             MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
@@ -65,6 +65,7 @@ pub fn probe_direct_mp4_event_loop(
         let descriptor = source
             .CreatePresentationDescriptor()
             .map_err(|e| format!("MP4 presentation descriptor: {e}"))?;
+        select_only_video_stream(&descriptor)?;
         source
             .Start(&descriptor, std::ptr::null(), &PROPVARIANT::default())
             .map_err(|e| format!("MP4 source start: {e}"))?;
@@ -129,6 +130,38 @@ pub fn probe_direct_mp4_event_loop(
         let _ = source.Shutdown();
         Ok(stats)
     }
+}
+
+unsafe fn select_only_video_stream(descriptor: &IMFPresentationDescriptor) -> Result<(), String> {
+    let mut video_found = false;
+    for index in 0..descriptor
+        .GetStreamDescriptorCount()
+        .map_err(|e| format!("MP4 streams: {e}"))?
+    {
+        let mut selected = BOOL(0);
+        let mut stream = None;
+        descriptor
+            .GetStreamDescriptorByIndex(index, &mut selected, &mut stream)
+            .map_err(|e| format!("MP4 stream {index}: {e}"))?;
+        let is_video = stream
+            .and_then(|stream| stream.GetMediaTypeHandler().ok())
+            .and_then(|handler| handler.GetCurrentMediaType().ok())
+            .and_then(|media_type| media_type.GetGUID(&MF_MT_MAJOR_TYPE).ok())
+            == Some(MFMediaType_Video);
+        if is_video && !video_found {
+            descriptor
+                .SelectStream(index)
+                .map_err(|e| format!("MP4 video selection: {e}"))?;
+            video_found = true;
+        } else {
+            descriptor
+                .DeselectStream(index)
+                .map_err(|e| format!("MP4 stream deselection: {e}"))?;
+        }
+    }
+    video_found
+        .then_some(())
+        .ok_or_else(|| "MP4 has no video stream.".into())
 }
 
 unsafe fn resolve_media_source(path: &str) -> Result<IMFMediaSource, String> {
@@ -301,6 +334,81 @@ pub struct DirectDecoderSession {
     _device: ID3D11Device,
     _context: ID3D11DeviceContext,
     _manager: IMFDXGIDeviceManager,
+}
+
+/// Reads one compressed video sample directly from the Media Source. It is
+/// deliberately synchronous and bounded: source, stream, and sample remain
+/// in one COM apartment until the sample is handed to the decoder.
+pub fn read_first_direct_video_sample(
+    path: &str,
+    timeout: Duration,
+) -> Result<windows::Win32::Media::MediaFoundation::IMFSample, String> {
+    unsafe {
+        let source = resolve_media_source(path)?;
+        let descriptor = source
+            .CreatePresentationDescriptor()
+            .map_err(|e| format!("MP4 presentation descriptor: {e}"))?;
+        select_only_video_stream(&descriptor)?;
+        source
+            .Start(&descriptor, std::ptr::null(), &PROPVARIANT::default())
+            .map_err(|e| format!("MP4 source start: {e}"))?;
+        let deadline = Instant::now() + timeout;
+        let mut stream: Option<IMFMediaStream> = None;
+        let mut sample = None;
+        while Instant::now() < deadline && sample.is_none() {
+            if let Some(active_stream) = stream.as_ref() {
+                match active_stream.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                    Ok(event) if event.GetType().ok() == Some(MEStreamStarted.0 as u32) => {
+                        active_stream
+                            .RequestSample(None::<&IUnknown>)
+                            .map_err(|e| format!("MP4 RequestSample: {e}"))?;
+                    }
+                    Ok(event) if event.GetType().ok() == Some(MEMediaSample.0 as u32) => {
+                        let value = event
+                            .GetValue()
+                            .map_err(|e| format!("MP4 sample event: {e}"))?;
+                        let object = IUnknown::try_from(&value)
+                            .map_err(|e| format!("MP4 sample object: {e}"))?;
+                        sample = Some(object.cast().map_err(|e| format!("MP4 sample cast: {e}"))?);
+                    }
+                    Ok(_) => {}
+                    Err(_) => thread::sleep(Duration::from_millis(2)),
+                }
+            } else {
+                match source.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                    Ok(event) if event.GetType().ok() == Some(MENewStream.0 as u32) => {
+                        let value = event
+                            .GetValue()
+                            .map_err(|e| format!("MP4 stream event: {e}"))?;
+                        let object = IUnknown::try_from(&value)
+                            .map_err(|e| format!("MP4 stream object: {e}"))?;
+                        stream = Some(object.cast().map_err(|e| format!("MP4 stream cast: {e}"))?);
+                    }
+                    Ok(_) => {}
+                    Err(_) => thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        }
+        let _ = source.Shutdown();
+        sample.ok_or_else(|| {
+            "Direct MP4 demuxer did not return a video sample before timeout.".into()
+        })
+    }
+}
+
+/// Executes the first native decoder operation against a real compressed MP4
+/// sample. Output conversion is intentionally a separate stage so a failure
+/// here can never leave user wallpaper playback without video.
+pub fn can_process_first_direct_mp4_sample(path: &str) -> Result<bool, String> {
+    let session = create_gpu_decoder_session_for_mp4(path)?;
+    let sample = read_first_direct_video_sample(path, Duration::from_secs(3))?;
+    unsafe {
+        session
+            .decoder
+            .ProcessInput(0, &sample, 0)
+            .map_err(|e| format!("Hardware MFT rejected the first MP4 sample: {e}"))?;
+    }
+    Ok(true)
 }
 
 /// Creates a D3D11 device and binds its Media Foundation device manager to an

@@ -540,6 +540,32 @@ pub extern "C" fn can_create_direct_gpu_decoder_session(file_path: *const c_char
     }
 }
 
+/// Diagnostic milestone for the native backend: pushes one real compressed
+/// MP4 video sample through `IMFTransform::ProcessInput` on the D3D11 decoder.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn can_process_direct_mp4_sample(file_path: *const c_char) -> bool {
+    if file_path.is_null() {
+        set_last_error("MP4 path is null.");
+        return false;
+    }
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .ok()
+        .map(str::to_owned);
+    let Some(path) = path else {
+        set_last_error("MP4 path is not valid UTF-8.");
+        return false;
+    };
+    match direct_mft::can_process_first_direct_mp4_sample(&path) {
+        Ok(result) => result,
+        Err(error) => {
+            set_last_error(&error);
+            false
+        }
+    }
+}
+
 /// Reports whether the active native renderer has actually presented at least
 /// one GPU frame. This is deliberately stricter than successful initialization.
 #[no_mangle]
