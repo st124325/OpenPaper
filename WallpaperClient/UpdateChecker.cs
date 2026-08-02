@@ -59,12 +59,14 @@ internal static class UpdateChecker
             if (!File.Exists(installerPath) || (expectedSize > 0 && new FileInfo(installerPath).Length != expectedSize))
             {
                 var temporaryPath = installerPath + ".download";
-                using var downloadResponse = await Client.GetAsync(installerUri, HttpCompletionOption.ResponseHeadersRead);
-                downloadResponse.EnsureSuccessStatusCode();
-                await using var source = await downloadResponse.Content.ReadAsStreamAsync();
-                await using var destination = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None);
-                await source.CopyToAsync(destination);
-                await destination.FlushAsync();
+                {
+                    using var downloadResponse = await Client.GetAsync(installerUri, HttpCompletionOption.ResponseHeadersRead);
+                    downloadResponse.EnsureSuccessStatusCode();
+                    await using var source = await downloadResponse.Content.ReadAsStreamAsync();
+                    await using var destination = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                    await source.CopyToAsync(destination);
+                    await destination.FlushAsync();
+                }
                 if (expectedSize > 0 && new FileInfo(temporaryPath).Length != expectedSize)
                 {
                     File.Delete(temporaryPath);
