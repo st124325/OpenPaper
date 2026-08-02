@@ -207,6 +207,81 @@ pub fn has_d3d11_hardware_decoder() -> bool {
     }
 }
 
+/// Activates a hardware decoder and gives it the exact compressed video media
+/// type advertised by the MP4 Media Source. A positive result proves more
+/// than codec enumeration: Windows accepted this file's H.264/HEVC stream at
+/// the decoder input boundary.
+pub fn can_configure_hardware_decoder_for_mp4(path: &str) -> Result<bool, String> {
+    unsafe {
+        let source = resolve_media_source(path)?;
+        let descriptor = source
+            .CreatePresentationDescriptor()
+            .map_err(|e| format!("MP4 presentation descriptor: {e}"))?;
+        let mut configured = false;
+        for index in 0..descriptor
+            .GetStreamDescriptorCount()
+            .map_err(|e| format!("MP4 streams: {e}"))?
+        {
+            let mut selected = BOOL(0);
+            let mut stream = None;
+            descriptor
+                .GetStreamDescriptorByIndex(index, &mut selected, &mut stream)
+                .map_err(|e| format!("MP4 stream {index}: {e}"))?;
+            let Some(stream) = stream else { continue };
+            let media_type = stream
+                .GetMediaTypeHandler()
+                .and_then(|handler| handler.GetCurrentMediaType())
+                .map_err(|e| format!("MP4 stream type: {e}"))?;
+            if media_type.GetGUID(&MF_MT_MAJOR_TYPE).ok() != Some(MFMediaType_Video) {
+                continue;
+            }
+            let subtype = media_type
+                .GetGUID(&MF_MT_SUBTYPE)
+                .map_err(|_| "MP4 video stream has no subtype.".to_string())?;
+            if subtype != MFVideoFormat_H264 && subtype != MFVideoFormat_HEVC {
+                break;
+            }
+            configured = configure_decoder_input(subtype, &media_type);
+            break;
+        }
+        let _ = source.Shutdown();
+        Ok(configured)
+    }
+}
+
+unsafe fn configure_decoder_input(
+    subtype: windows::core::GUID,
+    media_type: &windows::Win32::Media::MediaFoundation::IMFMediaType,
+) -> bool {
+    let input = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: subtype,
+    };
+    let mut activations = std::ptr::null_mut();
+    let mut count = 0u32;
+    let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
+    let result = MFTEnumEx(
+        MFT_CATEGORY_VIDEO_DECODER,
+        flags,
+        Some(&input),
+        None,
+        &mut activations,
+        &mut count,
+    );
+    if result.is_err() || activations.is_null() {
+        return false;
+    }
+    let entries = std::slice::from_raw_parts(activations, count as usize);
+    let accepted = entries.iter().flatten().any(|activation| {
+        activation
+            .ActivateObject::<IMFTransform>()
+            .and_then(|decoder| decoder.SetInputType(0, media_type, 0))
+            .is_ok()
+    });
+    CoTaskMemFree(Some(activations.cast()));
+    accepted
+}
+
 unsafe fn has_decoder_for_subtype(subtype: windows::core::GUID) -> bool {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,

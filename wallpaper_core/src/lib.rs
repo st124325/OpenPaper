@@ -482,6 +482,37 @@ pub extern "C" fn probe_direct_mp4_event_loop(file_path: *const c_char) -> u32 {
     }
 }
 
+/// Verifies that a hardware H.264/HEVC MFT accepts this MP4's compressed
+/// media type. This is diagnostic-only until the native renderer owns both
+/// the decoder's D3D11 device manager and its output surfaces.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn can_configure_direct_mft_decoder(file_path: *const c_char) -> bool {
+    if file_path.is_null() {
+        set_last_error("MP4 path is null.");
+        return false;
+    }
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .ok()
+        .map(str::to_owned);
+    let Some(path) = path else {
+        set_last_error("MP4 path is not valid UTF-8.");
+        return false;
+    };
+    match direct_mft::can_configure_hardware_decoder_for_mp4(&path) {
+        Ok(true) => true,
+        Ok(false) => {
+            set_last_error("No hardware MFT accepted this MP4 video media type.");
+            false
+        }
+        Err(error) => {
+            set_last_error(&error);
+            false
+        }
+    }
+}
+
 /// Reports whether the active native renderer has actually presented at least
 /// one GPU frame. This is deliberately stricter than successful initialization.
 #[no_mangle]
