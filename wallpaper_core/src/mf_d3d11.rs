@@ -45,8 +45,9 @@ use windows::{
             IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaEvent, IMFSample, IMFSourceReader,
             IMFSourceReaderCallback, IMFSourceReaderCallback_Impl, MFCreateAttributes,
             MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateSourceReaderFromURL,
-            MFMediaType_Video, MFStartup, MFVideoFormat_NV12, MFSTARTUP_FULL, MF_MT_MAJOR_TYPE,
-            MF_MT_SUBTYPE, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READERF_ENDOFSTREAM,
+            MFMediaType_Video, MFStartup, MFVideoFormat_NV12, MFSTARTUP_FULL, MF_MT_FRAME_SIZE,
+            MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+            MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
             MF_SOURCE_READER_ASYNC_CALLBACK, MF_SOURCE_READER_D3D_MANAGER,
             MF_SOURCE_READER_DISABLE_DXVA, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
         },
@@ -212,9 +213,14 @@ impl IMFSourceReaderCallback_Impl for AsyncReaderCallback_Impl {
             return Ok(());
         }
         // A type-change callback has no sample. Ask the render worker to
-        // request the next sample after this callback returns; re-entrant
-        // ReadSample calls are rejected by some hardware MFTs.
-        let _ = self.state.events.try_send(DecodeEvent::FormatChanged);
+        // query the new format and request the next sample only after this
+        // callback returns; re-entrant ReadSample calls are rejected by some
+        // hardware MFTs.
+        if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32 != 0 {
+            let _ = self.state.events.try_send(DecodeEvent::FormatChanged);
+        } else {
+            let _ = self.state.events.try_send(DecodeEvent::Error);
+        }
         Ok(())
     }
 
@@ -418,6 +424,7 @@ unsafe fn run_async_renderer(
                     })?;
                 }
                 Ok(DecodeEvent::FormatChanged) => {
+                    renegotiate_video_format(&mut pipeline)?;
                     callback_state.request_next().map_err(|error| {
                         format!("Could not continue after native format change: {error}")
                     })?;
@@ -443,6 +450,42 @@ unsafe fn run_async_renderer(
         // EOF is normal: drop the reader and its decoder surfaces, then
         // construct a fresh async reader for an infinite wallpaper loop.
     }
+}
+
+/// Handles MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED outside the callback.
+/// Source Reader can renegotiate after its first asynchronous request; the
+/// native path accepts only GPU-friendly NV12 and recreates cached processor
+/// state so dimensions cannot be inherited from the previous media type.
+unsafe fn renegotiate_video_format(pipeline: &mut NativeMp4Pipeline) -> Result<(), String> {
+    let media_type = pipeline
+        .reader
+        .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+        .map_err(|error| format!("Could not read the renegotiated media type: {error}"))?;
+    let major = media_type
+        .GetGUID(&MF_MT_MAJOR_TYPE)
+        .map_err(|error| format!("Renegotiated media type has no major type: {error}"))?;
+    if major != MFMediaType_Video {
+        return Err("Renegotiated Source Reader stream is not video.".into());
+    }
+    let subtype = media_type
+        .GetGUID(&MF_MT_SUBTYPE)
+        .map_err(|error| format!("Renegotiated video type has no subtype: {error}"))?;
+    if subtype != MFVideoFormat_NV12 {
+        return Err(format!(
+            "Native decoder renegotiated unsupported GPU subtype {subtype:?}; expected NV12."
+        ));
+    }
+    let frame_size = media_type
+        .GetUINT64(&MF_MT_FRAME_SIZE)
+        .map_err(|error| format!("Renegotiated video type has no frame size: {error}"))?;
+    let width = (frame_size >> 32) as u32;
+    let height = frame_size as u32;
+    if width == 0 || height == 0 {
+        return Err("Renegotiated video type has an invalid zero frame size.".into());
+    }
+    // The next sample's texture must match the newly reported dimensions.
+    pipeline.processor = None;
+    Ok(())
 }
 
 unsafe fn create_video_processor_resources(
