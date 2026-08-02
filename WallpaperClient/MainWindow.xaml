@@ -30,15 +30,21 @@
     <Grid Margin="16">
         <Border x:Name="MainSurface" Background="White" BorderBrush="#0D1117" BorderThickness="0.7" CornerRadius="22" Padding="28">
             <Grid>
-                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-                <Grid>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="12"/><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <Border x:Name="UpdateBanner" Visibility="Collapsed" Background="#111111" CornerRadius="14" Padding="14,9">
+                    <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <TextBlock x:Name="UpdateBannerText" Foreground="White" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                        <Button x:Name="UpdateNowButton" Grid.Column="1" Background="White" Foreground="#111111" Padding="14,7" Margin="12,0,0,0" Click="UpdateNow_Click"/>
+                    </Grid>
+                </Border>
+                <Grid Grid.Row="2">
                     <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition x:Name="HeaderAudioColumn" Width="250"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center"><Viewbox Width="30" Height="30" Margin="0,0,10,0"><Canvas Width="500" Height="500"><Rectangle Width="500" Height="500" Fill="#111111"/><Canvas><Canvas.RenderTransform><TranslateTransform X="250" Y="250"/></Canvas.RenderTransform><Path Data="M -20 -140 L 90 -110 C 140 -60 150 20 110 80 L 10 -10 C 50 -50 20 -100 -20 -140 Z" Fill="White" Opacity="0.95"/><Path Data="M 20 140 L -90 110 C -140 60 -150 -20 -110 -80 L -10 10 C -50 50 -20 100 20 140 Z" Fill="White" Opacity="0.65"/><Path Data="M -110 -40 L -30 -120 C 40 -150 120 -80 80 40 L -20 -20 C 20 -50 -40 -70 -110 -40 Z" Fill="White" Opacity="0.35"/></Canvas></Canvas></Viewbox><TextBlock x:Name="TitleText" FontSize="24" FontWeight="Bold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/></StackPanel>
                     <Border x:Name="AudioControl" Grid.Column="1" Background="#0F141414" CornerRadius="20" Padding="5,4" Margin="10,0"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="40"/><ColumnDefinition Width="*"/><ColumnDefinition Width="42"/></Grid.ColumnDefinitions><Button x:Name="MuteButton" Width="40" Height="40" Padding="0" Click="Mute_Click"><TextBlock x:Name="AudioIconText" Text="🔊" FontFamily="Segoe UI Emoji" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center"/></Button><Slider x:Name="VolumeSlider" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="5" Margin="9,0" Style="{StaticResource AudioSlider}" ValueChanged="VolumeChanged"/><TextBlock x:Name="VolumeValueText" Grid.Column="2" VerticalAlignment="Center" TextAlignment="Center" FontSize="12" FontWeight="Bold"/></Grid></Border>
                     <Button x:Name="SettingsButton" Grid.Column="2" Style="{StaticResource SoftButton}" Padding="14,8" Click="Settings_Click"/>
                 </Grid>
 
-                <Grid x:Name="LibraryPanel" Grid.Row="2">
+                <Grid x:Name="LibraryPanel" Grid.Row="4">
                     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="14"/><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="Auto"/><RowDefinition Height="10"/><RowDefinition Height="*"/><RowDefinition Height="12"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                     <TextBlock x:Name="FormatText" Foreground="#74787F" FontSize="14"/>
                     <TextBlock x:Name="LibraryTitleText" Grid.Row="2" VerticalAlignment="Center" FontSize="15" FontWeight="Bold"/>
@@ -52,7 +58,7 @@
                     <Button x:Name="AddLibraryButton" Grid.Row="8" Click="AddLibrary_Click"/>
                 </Grid>
 
-                <Grid x:Name="SettingsPanel" Grid.Row="2" Visibility="Collapsed">
+                <Grid x:Name="SettingsPanel" Grid.Row="4" Visibility="Collapsed">
                     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="Auto"/><RowDefinition Height="20"/><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="Auto"/><RowDefinition Height="16"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                     <TextBlock x:Name="LanguageSettingText" FontSize="15" FontWeight="Bold"/>
                     <Border Grid.Row="2" Background="#14141414" CornerRadius="22" Padding="3"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><Button x:Name="RuButton" Padding="12,8" Click="Russian_Click">Русский</Button><Button x:Name="EnButton" Grid.Column="1" Padding="12,8" Click="English_Click">English</Button></Grid></Border>
@@ -62,7 +68,7 @@
                     <Grid Grid.Row="10"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBlock x:Name="VersionLabelText" VerticalAlignment="Center" FontSize="14" FontWeight="Bold"/><Border Grid.Column="1" Background="#0F141414" CornerRadius="14" Padding="10,5"><TextBlock x:Name="VersionValueText" FontSize="12" FontWeight="Bold"/></Border></Grid>
                 </Grid>
 
-                <Border Grid.Row="3" Background="#0A141414" CornerRadius="14" Padding="14,10" VerticalAlignment="Bottom"><TextBlock x:Name="StatusText" Foreground="#4B4F55" FontSize="12" TextWrapping="Wrap"/></Border>
+                <Border Grid.Row="5" Background="#0A141414" CornerRadius="14" Padding="14,10" VerticalAlignment="Bottom"><TextBlock x:Name="StatusText" Foreground="#4B4F55" FontSize="12" TextWrapping="Wrap"/></Border>
             </Grid>
         </Border>
     </Grid>

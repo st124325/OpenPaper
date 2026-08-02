@@ -14,11 +14,14 @@ public partial class MainWindow : Window
     private bool _muted;
     private bool _syncingVolume;
     private int _lastVolume = 70;
+    private string? _availableUpdateVersion;
 
     public MainWindow()
     {
         InitializeComponent();
         Loaded += async (_, _) => await UpdateChecker.CheckAsync(this);
+        Closed += (_, _) => UpdateChecker.UpdateReady -= UpdateReady;
+        UpdateChecker.UpdateReady += UpdateReady;
         LibraryPanel.Visibility = Visibility.Visible;
         SettingsPanel.Visibility = Visibility.Collapsed;
         _loading = true;
@@ -73,6 +76,10 @@ public partial class MainWindow : Window
             : VolumeSlider.Value < 50 ? "🔉" : "🔊";
         VolumeValueText.Text = $"{(int)VolumeSlider.Value}%";
         UpdateLanguagePill();
+        UpdateBannerText.Text = _availableUpdateVersion is null
+            ? string.Empty
+            : T($"OpenPaper {_availableUpdateVersion} is ready.", $"OpenPaper {_availableUpdateVersion} готово к установке.");
+        UpdateNowButton.Content = T("Update now", "Обновить сейчас");
     }
 
     private void UpdateLanguagePill()
@@ -90,6 +97,19 @@ public partial class MainWindow : Window
         SettingsPanel.Visibility = showSettings ? Visibility.Visible : Visibility.Collapsed;
         LibraryPanel.Visibility = showSettings ? Visibility.Collapsed : Visibility.Visible;
         ApplyLanguage();
+    }
+
+    private void UpdateReady(string version)
+    {
+        _availableUpdateVersion = version;
+        UpdateBanner.Visibility = Visibility.Visible;
+        ApplyLanguage();
+    }
+
+    private void UpdateNow_Click(object sender, RoutedEventArgs e)
+    {
+        if (((App)System.Windows.Application.Current).ApplyPendingUpdate()) return;
+        SetStatus("The update is not ready yet. Please try again shortly.", "Обновление ещё не готово. Попробуйте через несколько секунд.");
     }
 
     private void Window_SizeChanged(object sender, SizeChangedEventArgs e)

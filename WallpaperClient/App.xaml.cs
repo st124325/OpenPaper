@@ -47,9 +47,19 @@ public partial class App : System.Windows.Application
 
     private void ExitApplication()
     {
+        ApplyPendingUpdate();
+        if (IsExiting) return;
         IsExiting = true;
-        UpdateChecker.TryLaunchPendingInstaller();
         Shutdown();
+    }
+
+    /// <summary>Starts the already verified installer and exits only for the update.</summary>
+    internal bool ApplyPendingUpdate()
+    {
+        if (!UpdateChecker.TryLaunchPendingInstaller()) return false;
+        IsExiting = true;
+        Shutdown();
+        return true;
     }
 
     private void OnUpdateReady(string version)

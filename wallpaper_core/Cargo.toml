@@ -22,3 +22,12 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 url = "2.5"
+
+# Shipping profile for the native wallpaper engine. The core is a small DLL
+# loaded once, so a longer release build is preferable to per-frame overhead.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
