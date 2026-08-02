@@ -513,6 +513,33 @@ pub extern "C" fn can_configure_direct_mft_decoder(file_path: *const c_char) -> 
     }
 }
 
+/// Diagnostic for the native renderer: verifies that Windows can bind an MFT
+/// decoder to a D3D11 DXGI device manager for this exact MP4. It does not yet
+/// route user playback away from the known-good libVLC fallback.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn can_create_direct_gpu_decoder_session(file_path: *const c_char) -> bool {
+    if file_path.is_null() {
+        set_last_error("MP4 path is null.");
+        return false;
+    }
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .ok()
+        .map(str::to_owned);
+    let Some(path) = path else {
+        set_last_error("MP4 path is not valid UTF-8.");
+        return false;
+    };
+    match direct_mft::create_gpu_decoder_session_for_mp4(&path) {
+        Ok(session) => unsafe { session.decoder.GetAttributes().is_ok() },
+        Err(error) => {
+            set_last_error(&error);
+            false
+        }
+    }
+}
+
 /// Reports whether the active native renderer has actually presented at least
 /// one GPU frame. This is deliberately stricter than successful initialization.
 #[no_mangle]

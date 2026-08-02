@@ -11,14 +11,25 @@ use std::{
 use windows::{
     core::{IUnknown, Interface, HSTRING, PCWSTR, PROPVARIANT},
     Win32::{
-        Foundation::BOOL,
+        Foundation::{BOOL, HMODULE},
+        Graphics::{
+            Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D11::{
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                D3D11_SDK_VERSION,
+            },
+            Dxgi::IDXGIAdapter,
+        },
         Media::MediaFoundation::{
-            IMFMediaSource, IMFMediaStream, IMFTransform, MEMediaSample, MENewStream,
-            MEStreamStarted, MFCreateSourceResolver, MFMediaType_Video, MFTEnumEx,
-            MFVideoFormat_H264, MFVideoFormat_HEVC, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG,
-            MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_REGISTER_TYPE_INFO,
-            MF_EVENT_FLAG_NO_WAIT, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_OBJECT_TYPE,
-            MF_RESOLUTION_MEDIASOURCE, MF_SA_D3D11_AWARE,
+            IMFDXGIDeviceManager, IMFMediaSource, IMFMediaStream, IMFTransform, MEMediaSample,
+            MENewStream, MEStreamStarted, MFCreateDXGIDeviceManager, MFCreateSourceResolver,
+            MFMediaType_Video, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_HEVC,
+            MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
+            MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+            MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
+            MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+            MF_OBJECT_TYPE, MF_RESOLUTION_MEDIASOURCE, MF_SA_D3D11_AWARE,
         },
         System::Com::CoTaskMemFree,
         UI::Shell::PropertiesSystem::IPropertyStore,
@@ -280,6 +291,140 @@ unsafe fn configure_decoder_input(
     });
     CoTaskMemFree(Some(activations.cast()));
     accepted
+}
+
+/// Owns every COM/D3D object required by a hardware decoder. The fields are
+/// intentionally kept together so the decoder can never outlive its device
+/// manager or use a D3D device from a different pipeline.
+pub struct DirectDecoderSession {
+    pub decoder: IMFTransform,
+    _device: ID3D11Device,
+    _context: ID3D11DeviceContext,
+    _manager: IMFDXGIDeviceManager,
+}
+
+/// Creates a D3D11 device and binds its Media Foundation device manager to an
+/// MFT which accepts the compressed video type from this MP4. The session is
+/// ready for ProcessInput/ProcessOutput; demuxed samples will be connected in
+/// the next renderer step.
+pub fn create_gpu_decoder_session_for_mp4(path: &str) -> Result<DirectDecoderSession, String> {
+    unsafe {
+        let source = resolve_media_source(path)?;
+        let descriptor = source
+            .CreatePresentationDescriptor()
+            .map_err(|e| format!("MP4 presentation descriptor: {e}"))?;
+        let mut video_type = None;
+        for index in 0..descriptor
+            .GetStreamDescriptorCount()
+            .map_err(|e| format!("MP4 streams: {e}"))?
+        {
+            let mut selected = BOOL(0);
+            let mut stream = None;
+            descriptor
+                .GetStreamDescriptorByIndex(index, &mut selected, &mut stream)
+                .map_err(|e| format!("MP4 stream {index}: {e}"))?;
+            let Some(stream) = stream else { continue };
+            let media_type = stream
+                .GetMediaTypeHandler()
+                .and_then(|handler| handler.GetCurrentMediaType())
+                .map_err(|e| format!("MP4 stream type: {e}"))?;
+            if media_type.GetGUID(&MF_MT_MAJOR_TYPE).ok() == Some(MFMediaType_Video) {
+                video_type = Some(media_type);
+                break;
+            }
+        }
+        let _ = source.Shutdown();
+        let video_type = video_type.ok_or_else(|| "MP4 has no video stream.".to_string())?;
+        let subtype = video_type
+            .GetGUID(&MF_MT_SUBTYPE)
+            .map_err(|_| "MP4 video stream has no subtype.".to_string())?;
+        if subtype != MFVideoFormat_H264 && subtype != MFVideoFormat_HEVC {
+            return Err("MP4 video codec is not H.264 or HEVC.".into());
+        }
+        let (device, context, manager) = create_decoder_device_manager()?;
+        let decoder = activate_gpu_decoder(subtype, &video_type, &manager)?;
+        Ok(DirectDecoderSession {
+            decoder,
+            _device: device,
+            _context: context,
+            _manager: manager,
+        })
+    }
+}
+
+unsafe fn create_decoder_device_manager(
+) -> Result<(ID3D11Device, ID3D11DeviceContext, IMFDXGIDeviceManager), String> {
+    let mut device = None;
+    let mut context = None;
+    D3D11CreateDevice(
+        None::<&IDXGIAdapter>,
+        D3D_DRIVER_TYPE_HARDWARE,
+        HMODULE::default(),
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        None,
+        D3D11_SDK_VERSION,
+        Some(&mut device),
+        None,
+        Some(&mut context),
+    )
+    .map_err(|e| format!("D3D11 hardware device creation failed: {e}"))?;
+    let device = device.ok_or_else(|| "D3D11 returned no device.".to_string())?;
+    let context = context.ok_or_else(|| "D3D11 returned no context.".to_string())?;
+    let mut token = 0;
+    let mut manager = None;
+    MFCreateDXGIDeviceManager(&mut token, &mut manager)
+        .map_err(|e| format!("DXGI device manager creation failed: {e}"))?;
+    let manager =
+        manager.ok_or_else(|| "Media Foundation returned no DXGI manager.".to_string())?;
+    manager
+        .ResetDevice(&device, token)
+        .map_err(|e| format!("DXGI device manager reset failed: {e}"))?;
+    Ok((device, context, manager))
+}
+
+unsafe fn activate_gpu_decoder(
+    subtype: windows::core::GUID,
+    media_type: &windows::Win32::Media::MediaFoundation::IMFMediaType,
+    manager: &IMFDXGIDeviceManager,
+) -> Result<IMFTransform, String> {
+    let input = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: subtype,
+    };
+    let mut activations = std::ptr::null_mut();
+    let mut count = 0u32;
+    let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
+    MFTEnumEx(
+        MFT_CATEGORY_VIDEO_DECODER,
+        flags,
+        Some(&input),
+        None,
+        &mut activations,
+        &mut count,
+    )
+    .map_err(|e| format!("Hardware decoder enumeration failed: {e}"))?;
+    if activations.is_null() {
+        return Err("No hardware decoder was found for this MP4 codec.".into());
+    }
+    let entries = std::slice::from_raw_parts(activations, count as usize);
+    let decoder = entries.iter().flatten().find_map(|activation| {
+        let decoder = activation.ActivateObject::<IMFTransform>().ok()?;
+        decoder
+            .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+            .ok()?;
+        decoder.SetInputType(0, media_type, 0).ok()?;
+        decoder
+            .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+            .ok()?;
+        decoder
+            .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+            .ok()?;
+        Some(decoder)
+    });
+    CoTaskMemFree(Some(activations.cast()));
+    decoder.ok_or_else(|| {
+        "No hardware decoder accepted the D3D11 device manager and MP4 media type.".into()
+    })
 }
 
 unsafe fn has_decoder_for_subtype(subtype: windows::core::GUID) -> bool {
