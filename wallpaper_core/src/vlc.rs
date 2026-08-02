@@ -48,7 +48,7 @@ pub struct VlcPlayer {
 impl VlcPlayer {
     /// Starts local media in the caller-owned Win32 host window.
     /// `OPENWALLPAPER_LIBVLC_DIR` must point at the NuGet `libvlc/win-x64` directory.
-    pub unsafe fn start(path: &str, hwnd: usize, performance_mode: i32) -> Result<Self, String> {
+    pub unsafe fn start(path: &str, hwnd: usize, performance_mode: i32, show_video: bool) -> Result<Self, String> {
         let runtime = env::var_os("OPENWALLPAPER_LIBVLC_DIR")
             .map(PathBuf::from)
             .filter(|directory| directory.is_dir())
@@ -100,6 +100,10 @@ impl VlcPlayer {
             // per-media :input-repeat option below remains as a second line
             // of defence for VLC modules that do not inherit this setting.
             CString::new("--repeat").unwrap(),
+            // Keep D3D11VA decoder surfaces and the presentation swap chain
+            // in the same D3D11 pipeline. Without an explicit D3D11 vout,
+            // VLC may choose a different renderer and add a GPU/CPU copy.
+            CString::new("--vout=direct3d11").unwrap(),
             CString::new("--avcodec-hw=d3d11va").unwrap(),
             plugin_path,
         ];
@@ -108,6 +112,9 @@ impl VlcPlayer {
         }
         if performance_mode == 0 {
             options.push(CString::new("--skip-frames").unwrap());
+        }
+        if !show_video {
+            options.push(CString::new("--no-video").unwrap());
         }
         let arguments: Vec<*const c_char> = options.iter().map(|value| value.as_ptr()).collect();
         let instance = libvlc_new(arguments.len() as c_int, arguments.as_ptr());
@@ -138,7 +145,9 @@ impl VlcPlayer {
             return Err("libVLC could not create a media player.".into());
         }
 
-        player_set_hwnd(player, hwnd as *mut c_void);
+        if show_video {
+            player_set_hwnd(player, hwnd as *mut c_void);
+        }
         if player_play(player) != 0 {
             player_release(player);
             media_release(media);

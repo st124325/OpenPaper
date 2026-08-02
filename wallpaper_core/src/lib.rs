@@ -44,8 +44,10 @@ struct EngineState {
     performance_mode: i32,
     d3d11_media_foundation_available: bool,
     native_mp4_preflight_available: bool,
+    native_mp4_diagnostic: String,
     last_error: String,
     player: Option<vlc::VlcPlayer>,
+    native_renderer: Option<mf_d3d11::NativeMp4Renderer>,
     monitor_stop: AtomicBool,
     fullscreen_paused: AtomicBool,
     monitor: Option<JoinHandle<()>>,
@@ -65,8 +67,10 @@ fn engine() -> &'static Mutex<EngineState> {
             performance_mode: 1,
             d3d11_media_foundation_available: false,
             native_mp4_preflight_available: false,
+            native_mp4_diagnostic: String::new(),
             last_error: String::new(),
             player: None,
+            native_renderer: None,
             monitor_stop: AtomicBool::new(false),
             fullscreen_paused: AtomicBool::new(false),
             monitor: None,
@@ -191,6 +195,7 @@ pub extern "C" fn init_engine() -> bool {
 /// Accepts UTF-8 absolute or relative path. The renderer implementation owns no
 /// pointer from the caller: the path is copied into Rust-owned `String`.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // C ABI keeps this callable from safe P/Invoke.
 pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
     // Explorer can recreate WorkerW after the app has started. Retry initialization
     // at the public API boundary instead of leaving the caller with stale state.
@@ -220,9 +225,12 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
         return false;
     }
 
-    // Validate the native MP4 path independently while libVLC remains the
-    // visible renderer. This lets us roll out the GPU presenter safely.
-    let native_mp4_preflight_available = if Path::new(&path)
+    // Validate native MP4 before switching libVLC into audio-only mode.
+    // Do not run a synchronous Source Reader probe in the UI/apply path: a
+    // decoder is allowed to block while producing its first frame. Stable
+    // builds must apply the wallpaper immediately through libVLC+D3D11VA.
+    let experimental_native_requested = std::env::var("OPENPAPER_EXPERIMENTAL_D3D11").as_deref() == Ok("1");
+    let native_probe = if experimental_native_requested && Path::new(&path)
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("mp4"))
@@ -231,26 +239,50 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
             Ok(state) => (state.host_window, state.d3d11_media_foundation_available),
             Err(_) => (0, false),
         };
-        native_renderer_available
-            && host_window != 0
-            && mf_d3d11::probe_mp4(&path, HWND(host_window as _)).is_ok()
+        if !native_renderer_available {
+            Err("D3D11/Media Foundation is unavailable on this computer.".to_string())
+        } else if host_window == 0 {
+            Err("The wallpaper host window is unavailable.".to_string())
+        } else {
+            mf_d3d11::probe_mp4(&path, HWND(host_window as _))
+        }
+    } else if experimental_native_requested {
+        Err("Native Media Foundation rendering currently supports MP4 only.".to_string())
     } else {
-        false
+        Err("Native renderer is disabled in the stable build; libVLC D3D11VA is active.".to_string())
     };
+    let native_mp4_preflight_available = native_probe.is_ok();
+    let native_mp4_diagnostic = native_probe.err().unwrap_or_else(|| "Native GPU preflight passed.".into());
 
     let mut state = match engine().lock() {
         Ok(value) => value,
         Err(_) => return false,
     };
     state.native_mp4_preflight_available = native_mp4_preflight_available;
+    state.native_mp4_diagnostic = native_mp4_diagnostic;
     if let Some(player) = state.player.take() {
         player.stop();
     }
+    if let Some(renderer) = state.native_renderer.take() {
+        renderer.stop();
+    }
+    // The native D3D11 renderer is intentionally opt-in until it succeeds
+    // reliably on varied real-world MP4 samples. Stable releases keep the
+    // proven libVLC D3D11VA output enabled by default.
+    let native_renderer = if native_mp4_preflight_available && experimental_native_requested {
+        mf_d3d11::NativeMp4Renderer::start(path.clone(), HWND(state.host_window as _)).ok()
+    } else {
+        None
+    };
+    let show_vlc_video = native_renderer.is_none();
     let player = match unsafe {
-        vlc::VlcPlayer::start(&path, state.host_window as usize, state.performance_mode)
+        vlc::VlcPlayer::start(&path, state.host_window as usize, state.performance_mode, show_vlc_video)
     } {
         Ok(player) => player,
         Err(error) => {
+            if let Some(renderer) = native_renderer {
+                renderer.stop();
+            }
             state.last_error = error;
             return false;
         }
@@ -259,6 +291,7 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
     unsafe { player.set_muted(state.muted || state.automatically_muted) };
     unsafe { player.set_volume(state.volume) };
     state.player = Some(player);
+    state.native_renderer = native_renderer;
     state.last_error.clear();
     true
 }
@@ -328,6 +361,7 @@ pub extern "C" fn set_volume(volume: i32) -> bool {
 /// Copies the most recent UTF-8 error into a caller-owned buffer and returns
 /// the complete message length (excluding the terminating NUL).
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // C ABI keeps this callable from safe P/Invoke.
 pub extern "C" fn get_last_error(buffer: *mut c_char, capacity: usize) -> usize {
     let message = engine()
         .lock()
@@ -357,6 +391,9 @@ pub extern "C" fn stop_engine() {
         state.last_error.clear();
         if let Some(player) = state.player.take() {
             player.stop();
+        }
+        if let Some(renderer) = state.native_renderer.take() {
+            renderer.stop();
         }
         if state.host_window != 0 {
             unsafe {
@@ -390,6 +427,26 @@ pub extern "C" fn is_native_mp4_pipeline_ready() -> bool {
         .lock()
         .map(|state| state.native_mp4_preflight_available)
         .unwrap_or(false)
+}
+
+/// Returns a diagnostic for the last native MP4 preflight. This is separate
+/// from `get_last_error`: the wallpaper can succeed via libVLC fallback.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn get_native_mp4_diagnostic(buffer: *mut c_char, capacity: usize) -> usize {
+    let message = engine()
+        .lock()
+        .map(|state| state.native_mp4_diagnostic.clone())
+        .unwrap_or_else(|_| "Engine state lock failed.".into());
+    let bytes = message.as_bytes();
+    if !buffer.is_null() && capacity != 0 {
+        let count = bytes.len().min(capacity - 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), count);
+            *buffer.add(count) = 0;
+        }
+    }
+    bytes.len()
 }
 
 /// Clears the static wallpaper and paints the desktop background solid black.
