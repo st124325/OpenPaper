@@ -48,7 +48,7 @@ struct EngineState {
     native_mp4_diagnostic: String,
     last_error: String,
     player: Option<vlc::VlcPlayer>,
-    native_renderer: Option<mf_d3d11::NativeMp4Renderer>,
+    native_renderer: Option<direct_mft::DirectMp4Renderer>,
     monitor_stop: AtomicBool,
     fullscreen_paused: AtomicBool,
     monitor: Option<JoinHandle<()>>,
@@ -229,21 +229,39 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
         Ok(value) => value,
         Err(_) => return false,
     };
-    // The former environment-variable opt-in used the Source Reader backend.
-    // It can stall after a media-type change on real MP4 files, producing
-    // audio without video. The new direct MFT path is retained as isolated
-    // diagnostics until it owns a continuous decode loop and loop restart.
-    // Never let either unfinished path replace stable user playback.
-    state.native_mp4_diagnostic =
-        "Native renderer is in safety validation; libVLC D3D11VA is active.".into();
     if let Some(player) = state.player.take() {
         player.stop();
     }
     if let Some(renderer) = state.native_renderer.take() {
         renderer.stop();
     }
-    let native_renderer: Option<mf_d3d11::NativeMp4Renderer> = None;
-    let show_vlc_video = true;
+    let is_mp4 = Path::new(&path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("mp4"));
+    let native_renderer = if is_mp4 && state.d3d11_media_foundation_available {
+        match direct_mft::DirectMp4Renderer::start(path.clone(), HWND(state.host_window as _)) {
+            Ok(renderer) => {
+                state.native_mp4_diagnostic =
+                    "Direct Media Foundation/DXVA renderer is active.".into();
+                Some(renderer)
+            }
+            Err(error) => {
+                state.native_mp4_diagnostic = format!(
+                    "Direct renderer preflight failed; libVLC D3D11VA fallback is active: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        state.native_mp4_diagnostic = if is_mp4 {
+            "D3D11 Media Foundation is unavailable; libVLC D3D11VA fallback is active.".into()
+        } else {
+            "GIF/WEBP playback uses libVLC.".into()
+        };
+        None
+    };
+    let show_vlc_video = native_renderer.is_none();
     let player = match unsafe {
         vlc::VlcPlayer::start(
             &path,
@@ -265,6 +283,10 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
     unsafe { player.set_muted(state.muted || state.automatically_muted) };
     unsafe { player.set_volume(state.volume) };
     state.player = Some(player);
+    if let Some(renderer) = native_renderer.as_ref() {
+        renderer.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
+        renderer.activate();
+    }
     state.native_renderer = native_renderer;
     state.last_error.clear();
     true
@@ -383,8 +405,7 @@ pub extern "C" fn stop_engine() {
 }
 
 /// Reports whether the native Media Foundation + D3D11 renderer can be used
-/// on this computer. The current release still falls back to libVLC playback
-/// while the native MP4 decoder and presenter are introduced incrementally.
+/// on this computer. Individual files are still preflighted before activation.
 #[no_mangle]
 pub extern "C" fn is_native_renderer_available() -> bool {
     engine()
@@ -840,6 +861,10 @@ unsafe fn resize_to_parent(host: HWND, parent: HWND) {
 }
 
 fn fullscreen_monitor(core: &'static Mutex<EngineState>) {
+    // Deterministic end-to-end tests can opt out without changing the normal
+    // user policy. The client never sets this diagnostic-only variable.
+    let fullscreen_pause_disabled =
+        std::env::var("OPENPAPER_DISABLE_FULLSCREEN_PAUSE").as_deref() == Ok("1");
     loop {
         let should_stop = core
             .lock()
@@ -848,7 +873,7 @@ fn fullscreen_monitor(core: &'static Mutex<EngineState>) {
         if should_stop {
             break;
         }
-        let fullscreen = unsafe { foreground_is_fullscreen() };
+        let fullscreen = !fullscreen_pause_disabled && unsafe { foreground_is_fullscreen() };
         let other_app_open = unsafe { foreground_is_external_application() };
         if let Ok(mut state) = core.lock() {
             fallback_to_vlc_if_native_failed(&mut state);
@@ -858,6 +883,9 @@ fn fullscreen_monitor(core: &'static Mutex<EngineState>) {
                     unsafe {
                         player.set_paused(fullscreen);
                     }
+                }
+                if let Some(renderer) = state.native_renderer.as_ref() {
+                    renderer.set_paused(fullscreen);
                 }
             }
             let automatic_mute = state.mute_when_other_app_open && other_app_open;

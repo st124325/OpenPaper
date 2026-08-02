@@ -1,12 +1,16 @@
-//! Capability discovery for the direct hardware-decoder backend.
+//! Direct Media Foundation/DXVA decoder and D3D11 wallpaper renderer.
 //!
-//! This deliberately does not route playback yet: an MFT consumes elementary
-//! H.264/HEVC samples, while MP4 demuxing is the next separate pipeline layer.
+//! MP4 demuxing, hardware decoding and presentation stay on one MTA thread;
+//! decoded NV12 surfaces remain in GPU memory through the VideoProcessor blit.
 
 use std::{
     collections::VecDeque,
     mem::ManuallyDrop,
-    thread,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc,
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -26,19 +30,21 @@ use windows::{
         },
         Media::MediaFoundation::{
             IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaSource, IMFMediaStream,
-            IMFPresentationDescriptor, IMFShutdown, IMFTransform, MEMediaSample, MENewStream,
-            MEStreamStarted, METransformHaveOutput, METransformNeedInput,
-            MFCreateDXGIDeviceManager, MFCreateSourceResolver, MFMediaType_Video, MFTEnumEx,
-            MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFT_CATEGORY_VIDEO_DECODER,
-            MFT_ENUM_FLAG, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER,
-            MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-            MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-            MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
-            MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-            MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_OBJECT_TYPE, MF_RESOLUTION_MEDIASOURCE,
-            MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+            IMFPresentationDescriptor, IMFSample, IMFShutdown, IMFTransform, MEEndOfStream,
+            MEMediaSample, MENewStream, MEStreamStarted, METransformHaveOutput,
+            METransformNeedInput, MFCreateDXGIDeviceManager, MFCreateSourceResolver,
+            MFMediaType_Video, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_HEVC,
+            MFVideoFormat_NV12, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ALL,
+            MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
+            MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+            MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
+            MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO,
+            MF_EVENT_FLAG_NO_WAIT, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
+            MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_OBJECT_TYPE,
+            MF_RESOLUTION_MEDIASOURCE, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC,
+            MF_TRANSFORM_ASYNC_UNLOCK,
         },
-        System::Com::CoTaskMemFree,
+        System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED},
         UI::Shell::PropertiesSystem::IPropertyStore,
     },
 };
@@ -511,6 +517,449 @@ unsafe fn process_sample_to_nv12(
 pub struct NativeSmokeStats {
     pub input_samples: u32,
     pub output_frames: u32,
+}
+
+/// Production MP4 renderer backed by the direct Media Source -> DXVA MFT ->
+/// D3D11 VideoProcessor pipeline. The startup handshake succeeds only after a
+/// real GPU frame has been presented, so callers can safely retain libVLC as a
+/// visual fallback when a codec or driver is incompatible.
+pub struct DirectMp4Renderer {
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    activated: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+    frames_presented: Arc<AtomicU64>,
+    finished: Arc<AtomicBool>,
+    worker: JoinHandle<()>,
+}
+
+impl DirectMp4Renderer {
+    pub fn start(path: String, host: HWND) -> Result<Self, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let activated = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let frames_presented = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let host_value = host.0 as isize;
+
+        let worker_stop = Arc::clone(&stop);
+        let worker_paused = Arc::clone(&paused);
+        let worker_activated = Arc::clone(&activated);
+        let worker_failed = Arc::clone(&failed);
+        let worker_frames = Arc::clone(&frames_presented);
+        let worker_finished = Arc::clone(&finished);
+        let worker = thread::spawn(move || unsafe {
+            let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+            let result = if initialized {
+                run_direct_playback(
+                    &path,
+                    HWND(host_value as _),
+                    &worker_stop,
+                    &worker_paused,
+                    &worker_activated,
+                    &worker_frames,
+                    &ready_tx,
+                )
+            } else {
+                Err("Could not initialize the native renderer COM apartment.".into())
+            };
+            if let Err(error) = result {
+                let _ = ready_tx.try_send(Err(error));
+                if !worker_stop.load(Ordering::Acquire) {
+                    worker_failed.store(true, Ordering::Release);
+                }
+            }
+            worker_finished.store(true, Ordering::Release);
+            if initialized {
+                CoUninitialize();
+            }
+        });
+
+        match ready_rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(Ok(())) => Ok(Self {
+                stop,
+                paused,
+                activated,
+                failed,
+                frames_presented,
+                finished,
+                worker,
+            }),
+            Ok(Err(error)) => {
+                stop.store(true, Ordering::Release);
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(_) => {
+                stop.store(true, Ordering::Release);
+                // A third-party codec/driver can block inside COM. Detach the
+                // thread on timeout rather than freezing the client UI.
+                if finished.load(Ordering::Acquire) {
+                    let _ = worker.join();
+                }
+                Err("Direct native renderer did not present its first GPU frame in time.".into())
+            }
+        }
+    }
+
+    /// Releases the playback clock after the audio-only libVLC instance has
+    /// started. The already-presented first frame remains visible meanwhile.
+    pub fn activate(&self) {
+        self.activated.store(true, Ordering::Release);
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+
+    pub fn stop(self) {
+        self.stop.store(true, Ordering::Release);
+        for _ in 0..20 {
+            if self.finished.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if self.finished.load(Ordering::Acquire) {
+            let _ = self.worker.join();
+        }
+    }
+
+    pub fn has_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    pub fn frames_presented(&self) -> u64 {
+        self.frames_presented.load(Ordering::Acquire)
+    }
+
+    // Kept for ABI-compatible diagnostic exports that formerly described the
+    // Source Reader callback backend. The direct Media Source path has no such
+    // callback or request HRESULTs.
+    pub fn callbacks_received(&self) -> u64 {
+        0
+    }
+
+    pub fn last_callback_status(&self) -> i32 {
+        0
+    }
+
+    pub fn last_callback_flags(&self) -> u32 {
+        0
+    }
+
+    pub fn last_request_status(&self) -> i32 {
+        0
+    }
+}
+
+unsafe fn run_direct_playback(
+    path: &str,
+    host: HWND,
+    stop: &AtomicBool,
+    paused: &AtomicBool,
+    activated: &AtomicBool,
+    frames_presented: &AtomicU64,
+    ready: &mpsc::SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    while !stop.load(Ordering::Acquire) {
+        run_direct_playback_cycle(path, host, stop, paused, activated, frames_presented, ready)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_direct_playback_cycle(
+    path: &str,
+    host: HWND,
+    stop: &AtomicBool,
+    paused: &AtomicBool,
+    activated: &AtomicBool,
+    frames_presented: &AtomicU64,
+    ready: &mpsc::SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    let session = create_gpu_decoder_session_for_mp4(path)?;
+    let mut presenter = session.create_presenter(host)?;
+    let source = resolve_media_source(path)?;
+    let result = (|| -> Result<(), String> {
+        let descriptor = source
+            .CreatePresentationDescriptor()
+            .map_err(|e| format!("MP4 presentation descriptor: {e}"))?;
+        select_only_video_stream(&descriptor)?;
+        source
+            .Start(&descriptor, std::ptr::null(), &PROPVARIANT::default())
+            .map_err(|e| format!("MP4 source start: {e}"))?;
+
+        let mut stream: Option<IMFMediaStream> = None;
+        let mut compressed: VecDeque<IMFSample> = VecDeque::with_capacity(8);
+        let mut decoded: VecDeque<IMFSample> = VecDeque::with_capacity(3);
+        let mut pending_need_input = 0u32;
+        let mut decoder_output_ready = false;
+        let mut stream_started = false;
+        let mut request_pending = false;
+        let mut end_of_stream = false;
+        let mut drain_started = false;
+        let mut last_progress = Instant::now();
+        let mut last_output = Instant::now();
+        let mut last_presented = Instant::now();
+        let mut clock_media = None::<i64>;
+        let mut clock_wall = None::<Instant>;
+
+        while !stop.load(Ordering::Acquire) {
+            if let Some(events) = session.events.as_ref() {
+                for _ in 0..64 {
+                    // Do not consume another HaveOutput event until there is
+                    // room for its GPU surface. This is real back-pressure:
+                    // dropping here caused periodic timestamp gaps and made a
+                    // 30 FPS source visibly run at roughly 12 FPS.
+                    if decoded.len() >= 3 {
+                        break;
+                    }
+                    let Ok(event) = events.GetEvent(MF_EVENT_FLAG_NO_WAIT) else {
+                        break;
+                    };
+                    match event.GetType().unwrap_or_default() {
+                        kind if kind == METransformNeedInput.0 as u32 => {
+                            pending_need_input = pending_need_input.saturating_add(1).min(64);
+                        }
+                        kind if kind == METransformHaveOutput.0 as u32 => {
+                            decoder_output_ready = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                while decoder_output_ready && decoded.len() < 3 {
+                    match try_process_output(&session)? {
+                        Some(frame) => {
+                            decoded.push_back(frame);
+                            last_progress = Instant::now();
+                            last_output = last_progress;
+                        }
+                        None => decoder_output_ready = false,
+                    }
+                }
+                while pending_need_input > 0 && !decoder_output_ready {
+                    let Some(sample) = compressed.pop_front() else {
+                        break;
+                    };
+                    session
+                        .decoder
+                        .ProcessInput(0, &sample, 0)
+                        .map_err(|e| format!("Async hardware MFT ProcessInput failed: {e}"))?;
+                    pending_need_input -= 1;
+                    last_progress = Instant::now();
+                }
+            } else {
+                // Synchronous MFTs can expose several output frames after one
+                // or more inputs. Drain only into the bounded queue, present
+                // it, and resume ProcessOutput on the next pump iteration.
+                for _ in 0..64 {
+                    while decoder_output_ready && decoded.len() < 3 {
+                        match try_process_output(&session)? {
+                            Some(frame) => {
+                                decoded.push_back(frame);
+                                last_progress = Instant::now();
+                                last_output = last_progress;
+                            }
+                            None => decoder_output_ready = false,
+                        }
+                    }
+                    if decoded.len() >= 3 || compressed.is_empty() {
+                        break;
+                    }
+                    let sample = compressed.front().expect("compressed queue is not empty");
+                    match session.decoder.ProcessInput(0, sample, 0) {
+                        Ok(()) => {
+                            compressed.pop_front();
+                            decoder_output_ready = true;
+                            last_progress = Instant::now();
+                        }
+                        Err(error) if error.code() == MF_E_NOTACCEPTING => {
+                            decoder_output_ready = true;
+                        }
+                        Err(error) => {
+                            return Err(format!("Hardware MFT ProcessInput failed: {error}"));
+                        }
+                    }
+                }
+            }
+
+            while let Some(frame) = decoded.pop_front() {
+                wait_for_presentation_time(
+                    &frame,
+                    stop,
+                    paused,
+                    activated,
+                    &mut clock_media,
+                    &mut clock_wall,
+                    frames_presented.load(Ordering::Acquire) == 0,
+                );
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                presenter.present(&frame)?;
+                let previous = frames_presented.fetch_add(1, Ordering::AcqRel);
+                if previous == 0 {
+                    let _ = ready.try_send(Ok(()));
+                }
+                last_progress = Instant::now();
+                last_output = last_progress;
+                last_presented = last_progress;
+            }
+
+            if let Some(active_stream) = stream.as_ref() {
+                if let Ok(event) = active_stream.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                    match event.GetType().unwrap_or_default() {
+                        kind if kind == MEStreamStarted.0 as u32 => {
+                            stream_started = true;
+                            last_progress = Instant::now();
+                        }
+                        kind if kind == MEMediaSample.0 as u32 => {
+                            request_pending = false;
+                            let value = event
+                                .GetValue()
+                                .map_err(|e| format!("MP4 sample event: {e}"))?;
+                            let object = IUnknown::try_from(&value)
+                                .map_err(|e| format!("MP4 sample object: {e}"))?;
+                            let sample: IMFSample =
+                                object.cast().map_err(|e| format!("MP4 sample cast: {e}"))?;
+                            compressed.push_back(sample);
+                            last_progress = Instant::now();
+                        }
+                        kind if kind == MEEndOfStream.0 as u32 => {
+                            request_pending = false;
+                            end_of_stream = true;
+                            last_progress = Instant::now();
+                        }
+                        _ => {}
+                    }
+                }
+                if stream_started && !end_of_stream && !request_pending && compressed.len() < 8 {
+                    active_stream
+                        .RequestSample(None::<&IUnknown>)
+                        .map_err(|e| format!("MP4 RequestSample: {e}"))?;
+                    request_pending = true;
+                }
+            } else {
+                match source.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                    Ok(event) if event.GetType().ok() == Some(MENewStream.0 as u32) => {
+                        let value = event
+                            .GetValue()
+                            .map_err(|e| format!("MP4 stream event: {e}"))?;
+                        let object = IUnknown::try_from(&value)
+                            .map_err(|e| format!("MP4 stream object: {e}"))?;
+                        stream = Some(object.cast().map_err(|e| format!("MP4 stream cast: {e}"))?);
+                        last_progress = Instant::now();
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            if session.events.is_none() {
+                while let Some(frame) = decoded.pop_front() {
+                    wait_for_presentation_time(
+                        &frame,
+                        stop,
+                        paused,
+                        activated,
+                        &mut clock_media,
+                        &mut clock_wall,
+                        frames_presented.load(Ordering::Acquire) == 0,
+                    );
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    presenter.present(&frame)?;
+                    let previous = frames_presented.fetch_add(1, Ordering::AcqRel);
+                    if previous == 0 {
+                        let _ = ready.try_send(Ok(()));
+                    }
+                    last_progress = Instant::now();
+                    last_output = last_progress;
+                    last_presented = last_progress;
+                }
+            }
+
+            if end_of_stream && compressed.is_empty() && !drain_started {
+                session
+                    .decoder
+                    .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
+                    .map_err(|e| format!("Hardware MFT end-of-stream notification failed: {e}"))?;
+                session
+                    .decoder
+                    .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
+                    .map_err(|e| format!("Hardware MFT drain failed: {e}"))?;
+                if session.events.is_none() {
+                    decoder_output_ready = true;
+                }
+                drain_started = true;
+                last_output = Instant::now();
+            }
+            if drain_started
+                && decoded.is_empty()
+                && last_output.elapsed() >= Duration::from_millis(150)
+            {
+                return Ok(());
+            }
+            if last_progress.elapsed() >= Duration::from_secs(8) {
+                return Err("Direct native renderer stalled while waiting for MP4 frames.".into());
+            }
+            if frames_presented.load(Ordering::Acquire) > 0
+                && activated.load(Ordering::Acquire)
+                && !paused.load(Ordering::Acquire)
+                && last_presented.elapsed() >= Duration::from_secs(8)
+            {
+                return Err("Direct native renderer stopped presenting GPU frames.".into());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    })();
+    let _ = source.Stop();
+    let _ = source.Shutdown();
+    result
+}
+
+unsafe fn wait_for_presentation_time(
+    frame: &IMFSample,
+    stop: &AtomicBool,
+    paused: &AtomicBool,
+    activated: &AtomicBool,
+    clock_media: &mut Option<i64>,
+    clock_wall: &mut Option<Instant>,
+    first_frame: bool,
+) {
+    if first_frame {
+        return;
+    }
+    let sample_time = frame.GetSampleTime().unwrap_or(0);
+    let media_origin = *clock_media.get_or_insert(sample_time);
+    clock_wall.get_or_insert_with(Instant::now);
+    let delta_100ns = sample_time.saturating_sub(media_origin).max(0) as u64;
+    let media_delta = Duration::from_nanos(delta_100ns.saturating_mul(100));
+    while !stop.load(Ordering::Acquire) {
+        if !activated.load(Ordering::Acquire) || paused.load(Ordering::Acquire) {
+            let waiting_started = Instant::now();
+            while (!activated.load(Ordering::Acquire) || paused.load(Ordering::Acquire))
+                && !stop.load(Ordering::Acquire)
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if let Some(origin) = clock_wall.as_mut() {
+                *origin += waiting_started.elapsed();
+            }
+            continue;
+        }
+        let target = clock_wall.expect("playback clock initialized") + media_delta;
+        if Instant::now() >= target {
+            break;
+        }
+        let remaining = target.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
 }
 
 /// Bounded end-to-end smoke test for the direct backend. It continuously
