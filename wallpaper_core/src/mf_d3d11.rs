@@ -6,7 +6,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
         mpsc, Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
@@ -86,6 +86,10 @@ pub struct NativeMp4Renderer {
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     frames_presented: Arc<AtomicU64>,
+    callbacks_received: Arc<AtomicU64>,
+    last_callback_status: Arc<AtomicI32>,
+    last_callback_flags: Arc<AtomicU32>,
+    last_request_status: Arc<AtomicI32>,
     finished: Arc<AtomicBool>,
     started_at: Instant,
     worker: JoinHandle<()>,
@@ -93,6 +97,7 @@ pub struct NativeMp4Renderer {
 
 enum DecodeEvent {
     Sample(IMFSample, i64),
+    FormatChanged,
     EndOfStream,
     Error,
 }
@@ -110,6 +115,10 @@ struct AsyncCallbackState {
     events: mpsc::SyncSender<DecodeEvent>,
     reader: Mutex<Option<IMFSourceReader>>,
     stop: Arc<AtomicBool>,
+    callbacks_received: Arc<AtomicU64>,
+    last_callback_status: Arc<AtomicI32>,
+    last_callback_flags: Arc<AtomicU32>,
+    last_request_status: Arc<AtomicI32>,
 }
 
 // Media Foundation documents that Source Reader callbacks may arrive on any
@@ -139,7 +148,7 @@ impl AsyncCallbackState {
             return Ok(());
         };
         // In asynchronous Source Reader mode every out argument must be NULL.
-        unsafe {
+        let result = unsafe {
             reader.ReadSample(
                 MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
                 0,
@@ -148,7 +157,12 @@ impl AsyncCallbackState {
                 None,
                 None,
             )
-        }
+        };
+        self.last_request_status.store(
+            result.as_ref().err().map_or(0, |error| error.code().0),
+            Ordering::Release,
+        );
+        result
     }
 }
 
@@ -161,6 +175,15 @@ impl IMFSourceReaderCallback_Impl for AsyncReaderCallback_Impl {
         timestamp_100ns: i64,
         sample: Option<&IMFSample>,
     ) -> windows::core::Result<()> {
+        self.state
+            .callbacks_received
+            .fetch_add(1, Ordering::Release);
+        self.state
+            .last_callback_status
+            .store(hrstatus.0, Ordering::Release);
+        self.state
+            .last_callback_flags
+            .store(flags, Ordering::Release);
         if self.state.stop.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -188,7 +211,11 @@ impl IMFSourceReaderCallback_Impl for AsyncReaderCallback_Impl {
             // consumed this one. Never block a Media Foundation callback.
             return Ok(());
         }
-        self.state.request_next()
+        // A type-change callback has no sample. Ask the render worker to
+        // request the next sample after this callback returns; re-entrant
+        // ReadSample calls are rejected by some hardware MFTs.
+        let _ = self.state.events.try_send(DecodeEvent::FormatChanged);
+        Ok(())
     }
 
     fn OnFlush(&self, _stream_index: u32) -> windows::core::Result<()> {
@@ -212,6 +239,14 @@ impl NativeMp4Renderer {
         let worker_failed = Arc::clone(&failed);
         let frames_presented = Arc::new(AtomicU64::new(0));
         let worker_frames_presented = Arc::clone(&frames_presented);
+        let callbacks_received = Arc::new(AtomicU64::new(0));
+        let worker_callbacks_received = Arc::clone(&callbacks_received);
+        let last_callback_status = Arc::new(AtomicI32::new(0));
+        let worker_last_callback_status = Arc::clone(&last_callback_status);
+        let last_callback_flags = Arc::new(AtomicU32::new(0));
+        let worker_last_callback_flags = Arc::clone(&last_callback_flags);
+        let last_request_status = Arc::new(AtomicI32::new(0));
+        let worker_last_request_status = Arc::clone(&last_request_status);
         let finished = Arc::new(AtomicBool::new(false));
         let worker_finished = Arc::clone(&finished);
         let host_value = host.0 as isize;
@@ -224,6 +259,10 @@ impl NativeMp4Renderer {
                 host,
                 &worker_stop,
                 &worker_frames_presented,
+                &worker_callbacks_received,
+                &worker_last_callback_status,
+                &worker_last_callback_flags,
+                &worker_last_request_status,
                 ready_tx,
             );
             if !worker_stop.load(Ordering::Acquire) {
@@ -239,6 +278,10 @@ impl NativeMp4Renderer {
                 stop,
                 failed,
                 frames_presented,
+                callbacks_received,
+                last_callback_status,
+                last_callback_flags,
+                last_request_status,
                 finished,
                 started_at: Instant::now(),
                 worker,
@@ -275,16 +318,37 @@ impl NativeMp4Renderer {
     pub fn frames_presented(&self) -> u64 {
         self.frames_presented.load(Ordering::Acquire)
     }
+
+    pub fn callbacks_received(&self) -> u64 {
+        self.callbacks_received.load(Ordering::Acquire)
+    }
+
+    pub fn last_callback_status(&self) -> i32 {
+        self.last_callback_status.load(Ordering::Acquire)
+    }
+
+    pub fn last_callback_flags(&self) -> u32 {
+        self.last_callback_flags.load(Ordering::Acquire)
+    }
+
+    pub fn last_request_status(&self) -> i32 {
+        self.last_request_status.load(Ordering::Acquire)
+    }
 }
 
 /// Runs decode asynchronously. The startup channel is completed after the
 /// first ReadSample request has been accepted, never after a decoded frame,
 /// so applying a wallpaper cannot be held hostage by a decoder.
+#[allow(clippy::too_many_arguments)]
 unsafe fn run_async_renderer(
     path: &str,
     host: HWND,
     stop: &Arc<AtomicBool>,
     frames_presented: &AtomicU64,
+    callbacks_received: &Arc<AtomicU64>,
+    last_callback_status: &Arc<AtomicI32>,
+    last_callback_flags: &Arc<AtomicU32>,
+    last_request_status: &Arc<AtomicI32>,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     let mut ready_tx = Some(ready_tx);
@@ -294,6 +358,10 @@ unsafe fn run_async_renderer(
             events: events_tx,
             reader: Mutex::new(None),
             stop: Arc::clone(stop),
+            callbacks_received: Arc::clone(callbacks_received),
+            last_callback_status: Arc::clone(last_callback_status),
+            last_callback_flags: Arc::clone(last_callback_flags),
+            last_request_status: Arc::clone(last_request_status),
         });
         // Share the original stop flag with the callback through a cheap
         // polling bridge; callback invocations must not depend on the UI.
@@ -347,6 +415,11 @@ unsafe fn run_async_renderer(
                     frames_presented.fetch_add(1, Ordering::Release);
                     callback_state.request_next().map_err(|error| {
                         format!("Could not request the next native frame: {error}")
+                    })?;
+                }
+                Ok(DecodeEvent::FormatChanged) => {
+                    callback_state.request_next().map_err(|error| {
+                        format!("Could not continue after native format change: {error}")
                     })?;
                 }
                 Ok(DecodeEvent::EndOfStream) => {

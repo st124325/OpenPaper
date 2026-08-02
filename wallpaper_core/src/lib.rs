@@ -444,6 +444,67 @@ pub extern "C" fn get_native_renderer_frame_count() -> u64 {
         .unwrap_or(0)
 }
 
+/// Counts callbacks delivered by Media Foundation. A zero value after the
+/// watchdog interval distinguishes a stalled source reader from a D3D11
+/// presentation failure.
+#[no_mangle]
+pub extern "C" fn get_native_renderer_callback_count() -> u64 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.callbacks_received())
+        })
+        .unwrap_or(0)
+}
+
+/// HRESULT reported by the latest Source Reader callback, or zero when no
+/// callback has arrived yet. Exposed for automated diagnostics only.
+#[no_mangle]
+pub extern "C" fn get_native_renderer_last_callback_status() -> i32 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.last_callback_status())
+        })
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn get_native_renderer_last_callback_flags() -> u32 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.last_callback_flags())
+        })
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn get_native_renderer_last_request_status() -> i32 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.last_request_status())
+        })
+        .unwrap_or(0)
+}
+
 /// Returns a diagnostic for the last native MP4 preflight. This is separate
 /// from `get_last_error`: the wallpaper can succeed via libVLC fallback.
 #[no_mangle]
