@@ -43,6 +43,7 @@ struct EngineState {
     volume: i32,
     performance_mode: i32,
     d3d11_media_foundation_available: bool,
+    native_mp4_preflight_available: bool,
     last_error: String,
     player: Option<vlc::VlcPlayer>,
     monitor_stop: AtomicBool,
@@ -63,6 +64,7 @@ fn engine() -> &'static Mutex<EngineState> {
             volume: 100,
             performance_mode: 1,
             d3d11_media_foundation_available: false,
+            native_mp4_preflight_available: false,
             last_error: String::new(),
             player: None,
             monitor_stop: AtomicBool::new(false),
@@ -218,10 +220,29 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
         return false;
     }
 
+    // Validate the native MP4 path independently while libVLC remains the
+    // visible renderer. This lets us roll out the GPU presenter safely.
+    let native_mp4_preflight_available = if Path::new(&path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("mp4"))
+    {
+        let (host_window, native_renderer_available) = match engine().lock() {
+            Ok(state) => (state.host_window, state.d3d11_media_foundation_available),
+            Err(_) => (0, false),
+        };
+        native_renderer_available
+            && host_window != 0
+            && mf_d3d11::probe_mp4(&path, HWND(host_window as _)).is_ok()
+    } else {
+        false
+    };
+
     let mut state = match engine().lock() {
         Ok(value) => value,
         Err(_) => return false,
     };
+    state.native_mp4_preflight_available = native_mp4_preflight_available;
     if let Some(player) = state.player.take() {
         player.stop();
     }
@@ -358,6 +379,16 @@ pub extern "C" fn is_native_renderer_available() -> bool {
     engine()
         .lock()
         .map(|state| state.d3d11_media_foundation_available)
+        .unwrap_or(false)
+}
+
+/// Reports whether the most recently selected MP4 passed the native Source
+/// Reader and D3D11 swap-chain preflight.
+#[no_mangle]
+pub extern "C" fn is_native_mp4_pipeline_ready() -> bool {
+    engine()
+        .lock()
+        .map(|state| state.native_mp4_preflight_available)
         .unwrap_or(false)
 }
 
