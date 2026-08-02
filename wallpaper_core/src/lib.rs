@@ -2,6 +2,7 @@
 //! Playback is provided by dynamically loaded libVLC (LGPL-2.1-or-later).
 
 mod vlc;
+mod mf_d3d11;
 
 use std::{
     ffi::CStr,
@@ -25,7 +26,6 @@ use windows::{
         System::{
             Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
             LibraryLoader::GetModuleHandleW,
-            Threading::GetCurrentProcessId,
         },
         UI::WindowsAndMessaging::*,
     },
@@ -42,6 +42,7 @@ struct EngineState {
     automatically_muted: bool,
     volume: i32,
     performance_mode: i32,
+    d3d11_media_foundation_available: bool,
     last_error: String,
     player: Option<vlc::VlcPlayer>,
     monitor_stop: AtomicBool,
@@ -61,6 +62,7 @@ fn engine() -> &'static Mutex<EngineState> {
             automatically_muted: false,
             volume: 100,
             performance_mode: 1,
+            d3d11_media_foundation_available: false,
             last_error: String::new(),
             player: None,
             monitor_stop: AtomicBool::new(false),
@@ -84,6 +86,7 @@ pub extern "C" fn init_engine() -> bool {
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        state.d3d11_media_foundation_available = mf_d3d11::hardware_pipeline_available();
         let progman = FindWindowW(w!("Progman"), PCWSTR::null()).unwrap_or_default();
         if progman.0.is_null() {
             state.last_error = "Progman desktop window was not found.".into();
@@ -266,17 +269,18 @@ pub extern "C" fn set_muted(muted: bool) -> bool {
     true
 }
 
-/// Enables automatic mute while another foreground application is active.
+/// Enables automatic mute while any ordinary foreground application is active.
 #[no_mangle]
 pub extern "C" fn set_mute_when_other_app_open(enabled: bool) -> bool {
+    // Apply the new policy immediately instead of waiting for the monitor's
+    // next polling tick. This also makes the settings toggle deterministic.
+    let automatically_muted = enabled && unsafe { foreground_is_external_application() };
     let mut state = match engine().lock() {
         Ok(value) => value,
         Err(_) => return false,
     };
     state.mute_when_other_app_open = enabled;
-    if !enabled {
-        state.automatically_muted = false;
-    }
+    state.automatically_muted = automatically_muted;
     if let Some(player) = state.player.as_ref() {
         unsafe { player.set_muted(state.muted || state.automatically_muted) };
     }
@@ -344,6 +348,17 @@ pub extern "C" fn stop_engine() {
     if let Some(thread) = monitor {
         let _ = thread.join();
     }
+}
+
+/// Reports whether the native Media Foundation + D3D11 renderer can be used
+/// on this computer. The current release still falls back to libVLC playback
+/// while the native MP4 decoder and presenter are introduced incrementally.
+#[no_mangle]
+pub extern "C" fn is_native_renderer_available() -> bool {
+    engine()
+        .lock()
+        .map(|state| state.d3d11_media_foundation_available)
+        .unwrap_or(false)
 }
 
 /// Clears the static wallpaper and paints the desktop background solid black.
@@ -463,7 +478,10 @@ unsafe fn foreground_is_external_application() -> bool {
     }
     let mut process_id = 0u32;
     let _ = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-    process_id != 0 && process_id != GetCurrentProcessId()
+    // OpenPaper's own window is also an ordinary foreground application.
+    // The user enabled this policy to silence wallpaper sound while working,
+    // including while the OpenPaper UI itself is open.
+    process_id != 0
 }
 
 unsafe fn foreground_is_fullscreen() -> bool {

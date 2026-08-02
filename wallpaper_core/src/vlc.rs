@@ -96,6 +96,10 @@ impl VlcPlayer {
             CString::new("--no-video-title-show").unwrap(),
             CString::new("--no-osd").unwrap(),
             CString::new("--no-media-library").unwrap(),
+            // Global loop policy covers every supported input type. The
+            // per-media :input-repeat option below remains as a second line
+            // of defence for VLC modules that do not inherit this setting.
+            CString::new("--repeat").unwrap(),
             CString::new("--avcodec-hw=d3d11va").unwrap(),
             plugin_path,
         ];
