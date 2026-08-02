@@ -421,6 +421,33 @@ pub extern "C" fn is_direct_mft_decoder_available() -> bool {
     direct_mft::has_d3d11_hardware_decoder()
 }
 
+/// Returns 1 for H.264, 2 for HEVC, or 0 when the direct MP4 demuxer cannot
+/// prepare this file. The detailed reason is available through get_last_error.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn probe_direct_mp4_demuxer(file_path: *const c_char) -> i32 {
+    if file_path.is_null() {
+        set_last_error("MP4 path is null.");
+        return 0;
+    }
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .ok()
+        .map(str::to_owned);
+    let Some(path) = path else {
+        set_last_error("MP4 path is not valid UTF-8.");
+        return 0;
+    };
+    match direct_mft::probe_mp4_demuxer(&path) {
+        Ok(direct_mft::DirectCodec::H264) => 1,
+        Ok(direct_mft::DirectCodec::Hevc) => 2,
+        Err(error) => {
+            set_last_error(&error);
+            0
+        }
+    }
+}
+
 /// Reports whether the active native renderer has actually presented at least
 /// one GPU frame. This is deliberately stricter than successful initialization.
 #[no_mangle]
