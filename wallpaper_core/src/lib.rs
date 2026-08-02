@@ -530,6 +530,7 @@ fn fullscreen_monitor(core: &'static Mutex<EngineState>) {
         let fullscreen = unsafe { foreground_is_fullscreen() };
         let other_app_open = unsafe { foreground_is_external_application() };
         if let Ok(mut state) = core.lock() {
+            fallback_to_vlc_if_native_failed(&mut state);
             let was_paused = state.fullscreen_paused.swap(fullscreen, Ordering::AcqRel);
             if was_paused != fullscreen {
                 if let Some(player) = state.player.as_ref() {
@@ -547,6 +548,40 @@ fn fullscreen_monitor(core: &'static Mutex<EngineState>) {
             }
         }
         thread::sleep(Duration::from_millis(750));
+    }
+}
+
+/// The native renderer is experimental. If its dedicated thread exits after a
+/// successful start, restore libVLC's proven D3D11VA visual output instead of
+/// leaving an audio-only wallpaper running.
+fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
+    let native_failed = state.native_renderer.as_ref().is_some_and(|renderer| renderer.has_failed());
+    if !native_failed {
+        return;
+    }
+    if let Some(renderer) = state.native_renderer.take() {
+        renderer.stop();
+    }
+    if let Some(player) = state.player.take() {
+        player.stop();
+    }
+    let Some(path) = state.active_media.as_deref() else {
+        state.last_error = "Native renderer stopped and no wallpaper path is available for fallback.".into();
+        return;
+    };
+    match unsafe { vlc::VlcPlayer::start(path, state.host_window as usize, state.performance_mode, true) } {
+        Ok(player) => {
+            unsafe {
+                player.set_muted(state.muted || state.automatically_muted);
+                player.set_volume(state.volume);
+                player.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
+            }
+            state.player = Some(player);
+            state.native_mp4_preflight_available = false;
+            state.native_mp4_diagnostic = "Native renderer failed during playback; libVLC D3D11VA fallback is active.".into();
+            state.last_error.clear();
+        }
+        Err(error) => state.last_error = format!("Native renderer failed and libVLC fallback could not start: {error}"),
     }
 }
 

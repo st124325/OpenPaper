@@ -24,13 +24,14 @@ use windows::{
                 D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
                 D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
                 D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11DeviceContext, ID3D11Texture2D,
-                ID3D11VideoContext, ID3D11VideoDevice,
+                ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
+                ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
             },
             Dxgi::{
                 Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC},
                 DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 DXGI_PRESENT, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIDevice, IDXGIFactory2,
-                IDXGIOutput, IDXGISwapChain1,
+                IDXGIOutput, IDXGISwapChain1, IDXGISwapChain3,
             },
         },
         Media::MediaFoundation::{
@@ -53,12 +54,28 @@ struct NativeMp4Pipeline {
     _manager: IMFDXGIDeviceManager,
     reader: IMFSourceReader,
     swap_chain: IDXGISwapChain1,
+    processor: Option<VideoProcessorResources>,
+}
+
+/// Objects whose creation is expensive. They are retained for every frame
+/// with the same source and output dimensions.
+struct VideoProcessorResources {
+    input_width: u32,
+    input_height: u32,
+    output_width: u32,
+    output_height: u32,
+    video_device: ID3D11VideoDevice,
+    video_context: ID3D11VideoContext,
+    _enumerator: ID3D11VideoProcessorEnumerator,
+    processor: ID3D11VideoProcessor,
+    output_views: Vec<ID3D11VideoProcessorOutputView>,
 }
 
 /// Owns the native render thread. Dropping it requests a clean stop and joins
 /// the thread, so a stopped wallpaper never leaves a D3D swap chain behind.
 pub struct NativeMp4Renderer {
     stop: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
     worker: JoinHandle<()>,
 }
 
@@ -66,6 +83,8 @@ impl NativeMp4Renderer {
     pub fn start(path: String, host: HWND) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let failed = Arc::new(AtomicBool::new(false));
+        let worker_failed = Arc::clone(&failed);
         let host_value = host.0 as isize;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || unsafe {
@@ -90,10 +109,13 @@ impl NativeMp4Renderer {
                     Err(_) => break,
                 };
             }
+            if !worker_stop.load(Ordering::Acquire) {
+                worker_failed.store(true, Ordering::Release);
+            }
             if initialized { CoUninitialize(); }
         });
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(Self { stop, worker }),
+            Ok(Ok(())) => Ok(Self { stop, failed, worker }),
             Ok(Err(error)) => { let _ = worker.join(); Err(error) }
             Err(_) => { stop.store(true, Ordering::Release); let _ = worker.join(); Err("Native renderer initialization timed out.".into()) }
         }
@@ -103,15 +125,76 @@ impl NativeMp4Renderer {
         self.stop.store(true, Ordering::Release);
         let _ = self.worker.join();
     }
+
+    pub fn has_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
 }
 
-/// Transfers one decoder-owned NV12 texture into the BGRA swap-chain back
-/// buffer. The video processor keeps both resources on the GPU: no pixels are
-/// read back into RAM or converted by the CPU.
+unsafe fn create_video_processor_resources(
+    pipeline: &NativeMp4Pipeline,
+    input_width: u32,
+    input_height: u32,
+) -> Result<VideoProcessorResources, String> {
+    let swap_description = pipeline.swap_chain.GetDesc1()
+        .map_err(|error| format!("Could not read the D3D11 swap-chain description: {error}"))?;
+    let video_device: ID3D11VideoDevice = pipeline.device.cast()
+        .map_err(|error| format!("Could not query the D3D11 video device: {error}"))?;
+    let video_context: ID3D11VideoContext = pipeline.context.cast()
+        .map_err(|error| format!("Could not query the D3D11 video context: {error}"))?;
+    let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+        InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        InputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+        InputWidth: input_width,
+        InputHeight: input_height,
+        OutputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+        OutputWidth: swap_description.Width,
+        OutputHeight: swap_description.Height,
+        Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    };
+    let enumerator = video_device.CreateVideoProcessorEnumerator(&content)
+        .map_err(|error| format!("Could not create the D3D11 video processor: {error}"))?;
+    let processor = video_device.CreateVideoProcessor(&enumerator, 0)
+        .map_err(|error| format!("Could not create the D3D11 video processor instance: {error}"))?;
+    let output_description = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+        ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+        },
+    };
+    let mut output_views = Vec::with_capacity(swap_description.BufferCount as usize);
+    for index in 0..swap_description.BufferCount {
+        let texture: ID3D11Texture2D = pipeline.swap_chain.GetBuffer(index)
+            .map_err(|error| format!("Could not get BGRA swap-chain buffer {index}: {error}"))?;
+        let mut output_view = None;
+        video_device.CreateVideoProcessorOutputView(&texture, &enumerator, &output_description, Some(&mut output_view))
+            .map_err(|error| format!("Could not create BGRA output view {index}: {error}"))?;
+        output_views.push(output_view.ok_or_else(|| format!("D3D11 returned no BGRA output view {index}."))?);
+    }
+    let source = RECT { left: 0, top: 0, right: input_width as i32, bottom: input_height as i32 };
+    let destination = RECT { left: 0, top: 0, right: swap_description.Width as i32, bottom: swap_description.Height as i32 };
+    video_context.VideoProcessorSetStreamFrameFormat(&processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    video_context.VideoProcessorSetStreamSourceRect(&processor, 0, BOOL(1), Some(&source));
+    video_context.VideoProcessorSetStreamDestRect(&processor, 0, BOOL(1), Some(&destination));
+    video_context.VideoProcessorSetOutputTargetRect(&processor, BOOL(1), Some(&destination));
+    Ok(VideoProcessorResources {
+        input_width,
+        input_height,
+        output_width: swap_description.Width,
+        output_height: swap_description.Height,
+        video_device,
+        video_context,
+        _enumerator: enumerator,
+        processor,
+        output_views,
+    })
+}
+
+/// Transfers one decoder-owned NV12 texture into the current BGRA swap-chain
+/// back buffer. The processor/output views are cached across frames, so no
+/// pixels cross the CPU boundary and no expensive pipeline objects are rebuilt.
 unsafe fn present_nv12_sample(
-    device: &ID3D11Device,
-    context: &ID3D11DeviceContext,
-    swap_chain: &IDXGISwapChain1,
+    pipeline: &mut NativeMp4Pipeline,
     sample: &windows::Win32::Media::MediaFoundation::IMFSample,
 ) -> Result<(), String> {
     let buffer = sample.GetBufferByIndex(0)
@@ -128,29 +211,16 @@ unsafe fn present_nv12_sample(
 
     let mut input_size = Default::default();
     input_texture.GetDesc(&mut input_size);
-    let output_texture: ID3D11Texture2D = swap_chain.GetBuffer(0)
-        .map_err(|error| format!("Could not get the BGRA swap-chain back buffer: {error}"))?;
-    let mut output_size = Default::default();
-    output_texture.GetDesc(&mut output_size);
-    let video_device: ID3D11VideoDevice = device.cast()
-        .map_err(|error| format!("Could not query the D3D11 video device: {error}"))?;
-    let video_context: ID3D11VideoContext = context.cast()
-        .map_err(|error| format!("Could not query the D3D11 video context: {error}"))?;
-
-    let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
-        InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-        InputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
-        InputWidth: input_size.Width,
-        InputHeight: input_size.Height,
-        OutputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
-        OutputWidth: output_size.Width,
-        OutputHeight: output_size.Height,
-        Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    };
-    let enumerator = video_device.CreateVideoProcessorEnumerator(&content)
-        .map_err(|error| format!("Could not create the D3D11 video processor: {error}"))?;
-    let processor = video_device.CreateVideoProcessor(&enumerator, 0)
-        .map_err(|error| format!("Could not create the D3D11 video processor instance: {error}"))?;
+    let swap_description = pipeline.swap_chain.GetDesc1()
+        .map_err(|error| format!("Could not read the D3D11 swap-chain description: {error}"))?;
+    let needs_rebuild = pipeline.processor.as_ref().is_none_or(|resources| {
+        resources.input_width != input_size.Width || resources.input_height != input_size.Height
+            || resources.output_width != swap_description.Width || resources.output_height != swap_description.Height
+    });
+    if needs_rebuild {
+        pipeline.processor = Some(create_video_processor_resources(pipeline, input_size.Width, input_size.Height)?);
+    }
+    let resources = pipeline.processor.as_ref().expect("processor resources were just created");
 
     let input_description = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
         FourCC: 0,
@@ -160,38 +230,26 @@ unsafe fn present_nv12_sample(
         },
     };
     let mut input_view = None;
-    video_device.CreateVideoProcessorInputView(&input_texture, &enumerator, &input_description, Some(&mut input_view))
+    resources.video_device.CreateVideoProcessorInputView(&input_texture, &resources._enumerator, &input_description, Some(&mut input_view))
         .map_err(|error| format!("Could not create the NV12 input view: {error}"))?;
     let input_view = input_view.ok_or_else(|| "D3D11 returned no NV12 input view.".to_string())?;
 
-    let output_description = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-        ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-        Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-            Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-        },
-    };
-    let mut output_view = None;
-    video_device.CreateVideoProcessorOutputView(&output_texture, &enumerator, &output_description, Some(&mut output_view))
-        .map_err(|error| format!("Could not create the BGRA output view: {error}"))?;
-    let output_view = output_view.ok_or_else(|| "D3D11 returned no BGRA output view.".to_string())?;
-
-    let source = RECT { left: 0, top: 0, right: input_size.Width as i32, bottom: input_size.Height as i32 };
-    let destination = RECT { left: 0, top: 0, right: output_size.Width as i32, bottom: output_size.Height as i32 };
-    video_context.VideoProcessorSetStreamFrameFormat(&processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-    video_context.VideoProcessorSetStreamSourceRect(&processor, 0, BOOL(1), Some(&source));
-    video_context.VideoProcessorSetStreamDestRect(&processor, 0, BOOL(1), Some(&destination));
-    video_context.VideoProcessorSetOutputTargetRect(&processor, BOOL(1), Some(&destination));
+    let swap_chain3: IDXGISwapChain3 = pipeline.swap_chain.cast()
+        .map_err(|error| format!("Could not query IDXGISwapChain3: {error}"))?;
+    let current_buffer = swap_chain3.GetCurrentBackBufferIndex() as usize;
+    let output_view = resources.output_views.get(current_buffer)
+        .ok_or_else(|| format!("Swap chain returned invalid back-buffer index {current_buffer}."))?;
 
     let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
         Enable: BOOL(1),
         pInputSurface: std::mem::ManuallyDrop::new(Some(input_view)),
         ..Default::default()
     };
-    video_context.VideoProcessorBlt(&processor, &output_view, 0, std::slice::from_ref(&stream))
+    resources.video_context.VideoProcessorBlt(&resources.processor, output_view, 0, std::slice::from_ref(&stream))
         .map_err(|error| format!("GPU NV12-to-BGRA conversion failed: {error}"))?;
     // windows-rs models the C union as ManuallyDrop; balance its COM reference.
     std::mem::ManuallyDrop::drop(&mut stream.pInputSurface);
-    swap_chain.Present(0, DXGI_PRESENT(0)).ok()
+    pipeline.swap_chain.Present(0, DXGI_PRESENT(0)).ok()
         .map_err(|error| format!("Could not present the GPU-converted frame: {error}"))?;
     Ok(())
 }
@@ -304,6 +362,7 @@ unsafe fn create_pipeline(path: &str, host: HWND) -> Result<NativeMp4Pipeline, S
             _manager: manager,
             reader,
             swap_chain,
+            processor: None,
         })
     }
 }
@@ -334,7 +393,7 @@ unsafe fn render_loop(pipeline: &mut NativeMp4Pipeline, stop: &AtomicBool) -> Re
             thread::sleep((due - origin.elapsed()).min(Duration::from_millis(10)));
         }
         if stop.load(Ordering::Acquire) { break; }
-        if present_nv12_sample(&pipeline.device, &pipeline.context, &pipeline.swap_chain, &sample).is_err() {
+        if present_nv12_sample(pipeline, &sample).is_err() {
             return Err(());
         }
     }
@@ -344,7 +403,7 @@ unsafe fn render_loop(pipeline: &mut NativeMp4Pipeline, stop: &AtomicBool) -> Re
 /// Decodes and presents a native frame for a diagnostics/preflight check.
 pub fn probe_mp4(path: &str, host: HWND) -> Result<(), String> {
     unsafe {
-        let pipeline = create_pipeline(path, host)?;
+        let mut pipeline = create_pipeline(path, host)?;
         let video_stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
         let mut flags = 0u32;
         let mut sample = None;
@@ -356,6 +415,6 @@ pub fn probe_mp4(path: &str, host: HWND) -> Result<(), String> {
             return Err("The native decoder reached end-of-stream before its first frame.".into());
         }
         let sample = sample.ok_or_else(|| "The native decoder returned no video frame.".to_string())?;
-        present_nv12_sample(&pipeline.device, &pipeline.context, &pipeline.swap_chain, &sample)
+        present_nv12_sample(&mut pipeline, &sample)
     }
 }
