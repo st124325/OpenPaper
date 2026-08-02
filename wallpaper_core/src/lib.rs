@@ -224,47 +224,25 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
         return false;
     }
 
-    // Async Source Reader startup never waits for a decoded frame. A watchdog
-    // in the fullscreen monitor falls back to libVLC if no GPU frame appears.
-    let experimental_native_requested =
-        std::env::var("OPENPAPER_EXPERIMENTAL_D3D11").as_deref() == Ok("1");
     let mut state = match engine().lock() {
         Ok(value) => value,
         Err(_) => return false,
     };
-    let native_mp4_requested = experimental_native_requested
-        && Path::new(&path)
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("mp4"));
-    state.native_mp4_diagnostic = if native_mp4_requested {
-        "Native renderer is starting asynchronously; GPU-frame watchdog is armed.".into()
-    } else if experimental_native_requested {
-        "Native Media Foundation rendering currently supports MP4 only.".into()
-    } else {
-        "Native renderer is disabled in the stable build; libVLC D3D11VA is active.".into()
-    };
+    // The former environment-variable opt-in used the Source Reader backend.
+    // It can stall after a media-type change on real MP4 files, producing
+    // audio without video. The new direct MFT path is retained as isolated
+    // diagnostics until it owns a continuous decode loop and loop restart.
+    // Never let either unfinished path replace stable user playback.
+    state.native_mp4_diagnostic =
+        "Native renderer is in safety validation; libVLC D3D11VA is active.".into();
     if let Some(player) = state.player.take() {
         player.stop();
     }
     if let Some(renderer) = state.native_renderer.take() {
         renderer.stop();
     }
-    // The native D3D11 renderer is intentionally opt-in until it succeeds
-    // reliably on varied real-world MP4 samples. Stable releases keep the
-    // proven libVLC D3D11VA output enabled by default.
-    let native_renderer = if native_mp4_requested && state.d3d11_media_foundation_available {
-        match mf_d3d11::NativeMp4Renderer::start(path.clone(), HWND(state.host_window as _)) {
-            Ok(renderer) => Some(renderer),
-            Err(error) => {
-                state.native_mp4_diagnostic = format!("Native renderer did not start: {error}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let show_vlc_video = native_renderer.is_none();
+    let native_renderer = None;
+    let show_vlc_video = true;
     let player = match unsafe {
         vlc::VlcPlayer::start(
             &path,
