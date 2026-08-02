@@ -61,6 +61,8 @@ public partial class MainWindow : Window
         AutoStartLabelText.Text = T("Start with Windows", "Запускать вместе с Windows");
         OtherAppsMuteLabelText.Text = T("Mute wallpaper when another app is active", "Отключать звук обоев при открытом приложении");
         PerformanceLabelText.Text = T("Performance", "Производительность");
+        VersionLabelText.Text = T("Installed version", "Текущая версия");
+        VersionValueText.Text = $"v{typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"}";
         MuteButton.ToolTip = T(_muted ? "Turn sound on" : "Turn sound off", _muted ? "Включить звук" : "Выключить звук");
         MuteButton.Background = _muted
             ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 224, 228))
