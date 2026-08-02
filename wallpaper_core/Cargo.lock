@@ -278,6 +278,7 @@ version = "0.1.0"
 dependencies = [
  "url",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 //! Minimal, C-ABI-stable Windows wallpaper core.
 //! Playback is provided by dynamically loaded libVLC (LGPL-2.1-or-later).
 
-mod vlc;
 mod mf_d3d11;
+mod vlc;
 
 use std::{
     ffi::CStr,
@@ -43,7 +43,6 @@ struct EngineState {
     volume: i32,
     performance_mode: i32,
     d3d11_media_foundation_available: bool,
-    native_mp4_preflight_available: bool,
     native_mp4_diagnostic: String,
     last_error: String,
     player: Option<vlc::VlcPlayer>,
@@ -66,7 +65,6 @@ fn engine() -> &'static Mutex<EngineState> {
             volume: 100,
             performance_mode: 1,
             d3d11_media_foundation_available: false,
-            native_mp4_preflight_available: false,
             native_mp4_diagnostic: String::new(),
             last_error: String::new(),
             player: None,
@@ -225,41 +223,26 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
         return false;
     }
 
-    // Validate native MP4 before switching libVLC into audio-only mode.
-    // Do not run a synchronous Source Reader probe in the UI/apply path: a
-    // decoder is allowed to block while producing its first frame. Stable
-    // builds must apply the wallpaper immediately through libVLC+D3D11VA.
-    let experimental_native_requested = std::env::var("OPENPAPER_EXPERIMENTAL_D3D11").as_deref() == Ok("1");
-    let native_probe = if experimental_native_requested && Path::new(&path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("mp4"))
-    {
-        let (host_window, native_renderer_available) = match engine().lock() {
-            Ok(state) => (state.host_window, state.d3d11_media_foundation_available),
-            Err(_) => (0, false),
-        };
-        if !native_renderer_available {
-            Err("D3D11/Media Foundation is unavailable on this computer.".to_string())
-        } else if host_window == 0 {
-            Err("The wallpaper host window is unavailable.".to_string())
-        } else {
-            mf_d3d11::probe_mp4(&path, HWND(host_window as _))
-        }
-    } else if experimental_native_requested {
-        Err("Native Media Foundation rendering currently supports MP4 only.".to_string())
-    } else {
-        Err("Native renderer is disabled in the stable build; libVLC D3D11VA is active.".to_string())
-    };
-    let native_mp4_preflight_available = native_probe.is_ok();
-    let native_mp4_diagnostic = native_probe.err().unwrap_or_else(|| "Native GPU preflight passed.".into());
-
+    // Async Source Reader startup never waits for a decoded frame. A watchdog
+    // in the fullscreen monitor falls back to libVLC if no GPU frame appears.
+    let experimental_native_requested =
+        std::env::var("OPENPAPER_EXPERIMENTAL_D3D11").as_deref() == Ok("1");
     let mut state = match engine().lock() {
         Ok(value) => value,
         Err(_) => return false,
     };
-    state.native_mp4_preflight_available = native_mp4_preflight_available;
-    state.native_mp4_diagnostic = native_mp4_diagnostic;
+    let native_mp4_requested = experimental_native_requested
+        && Path::new(&path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("mp4"));
+    state.native_mp4_diagnostic = if native_mp4_requested {
+        "Native renderer is starting asynchronously; GPU-frame watchdog is armed.".into()
+    } else if experimental_native_requested {
+        "Native Media Foundation rendering currently supports MP4 only.".into()
+    } else {
+        "Native renderer is disabled in the stable build; libVLC D3D11VA is active.".into()
+    };
     if let Some(player) = state.player.take() {
         player.stop();
     }
@@ -269,14 +252,25 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
     // The native D3D11 renderer is intentionally opt-in until it succeeds
     // reliably on varied real-world MP4 samples. Stable releases keep the
     // proven libVLC D3D11VA output enabled by default.
-    let native_renderer = if native_mp4_preflight_available && experimental_native_requested {
-        mf_d3d11::NativeMp4Renderer::start(path.clone(), HWND(state.host_window as _)).ok()
+    let native_renderer = if native_mp4_requested && state.d3d11_media_foundation_available {
+        match mf_d3d11::NativeMp4Renderer::start(path.clone(), HWND(state.host_window as _)) {
+            Ok(renderer) => Some(renderer),
+            Err(error) => {
+                state.native_mp4_diagnostic = format!("Native renderer did not start: {error}");
+                None
+            }
+        }
     } else {
         None
     };
     let show_vlc_video = native_renderer.is_none();
     let player = match unsafe {
-        vlc::VlcPlayer::start(&path, state.host_window as usize, state.performance_mode, show_vlc_video)
+        vlc::VlcPlayer::start(
+            &path,
+            state.host_window as usize,
+            state.performance_mode,
+            show_vlc_video,
+        )
     } {
         Ok(player) => player,
         Err(error) => {
@@ -419,14 +413,35 @@ pub extern "C" fn is_native_renderer_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Reports whether the most recently selected MP4 passed the native Source
-/// Reader and D3D11 swap-chain preflight.
+/// Reports whether the active native renderer has actually presented at least
+/// one GPU frame. This is deliberately stricter than successful initialization.
 #[no_mangle]
 pub extern "C" fn is_native_mp4_pipeline_ready() -> bool {
     engine()
         .lock()
-        .map(|state| state.native_mp4_preflight_available)
+        .map(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .is_some_and(|renderer| !renderer.has_failed() && renderer.frames_presented() > 0)
+        })
         .unwrap_or(false)
+}
+
+/// Diagnostic counter used by automated native-renderer smoke tests. It
+/// advances only after D3D11 VideoProcessorBlt and Present have both succeeded.
+#[no_mangle]
+pub extern "C" fn get_native_renderer_frame_count() -> u64 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.frames_presented())
+        })
+        .unwrap_or(0)
 }
 
 /// Returns a diagnostic for the last native MP4 preflight. This is separate
@@ -555,7 +570,10 @@ fn fullscreen_monitor(core: &'static Mutex<EngineState>) {
 /// successful start, restore libVLC's proven D3D11VA visual output instead of
 /// leaving an audio-only wallpaper running.
 fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
-    let native_failed = state.native_renderer.as_ref().is_some_and(|renderer| renderer.has_failed());
+    let native_failed = state
+        .native_renderer
+        .as_ref()
+        .is_some_and(|renderer| renderer.has_failed());
     if !native_failed {
         return;
     }
@@ -566,10 +584,18 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
         player.stop();
     }
     let Some(path) = state.active_media.as_deref() else {
-        state.last_error = "Native renderer stopped and no wallpaper path is available for fallback.".into();
+        state.last_error =
+            "Native renderer stopped and no wallpaper path is available for fallback.".into();
         return;
     };
-    match unsafe { vlc::VlcPlayer::start(path, state.host_window as usize, state.performance_mode, true) } {
+    match unsafe {
+        vlc::VlcPlayer::start(
+            path,
+            state.host_window as usize,
+            state.performance_mode,
+            true,
+        )
+    } {
         Ok(player) => {
             unsafe {
                 player.set_muted(state.muted || state.automatically_muted);
@@ -577,11 +603,14 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
                 player.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
             }
             state.player = Some(player);
-            state.native_mp4_preflight_available = false;
-            state.native_mp4_diagnostic = "Native renderer failed during playback; libVLC D3D11VA fallback is active.".into();
+            state.native_mp4_diagnostic =
+                "Native renderer failed during playback; libVLC D3D11VA fallback is active.".into();
             state.last_error.clear();
         }
-        Err(error) => state.last_error = format!("Native renderer failed and libVLC fallback could not start: {error}"),
+        Err(error) => {
+            state.last_error =
+                format!("Native renderer failed and libVLC fallback could not start: {error}")
+        }
     }
 }
 

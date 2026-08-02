@@ -48,7 +48,12 @@ pub struct VlcPlayer {
 impl VlcPlayer {
     /// Starts local media in the caller-owned Win32 host window.
     /// `OPENWALLPAPER_LIBVLC_DIR` must point at the NuGet `libvlc/win-x64` directory.
-    pub unsafe fn start(path: &str, hwnd: usize, performance_mode: i32, show_video: bool) -> Result<Self, String> {
+    pub unsafe fn start(
+        path: &str,
+        hwnd: usize,
+        performance_mode: i32,
+        show_video: bool,
+    ) -> Result<Self, String> {
         let runtime = env::var_os("OPENWALLPAPER_LIBVLC_DIR")
             .map(PathBuf::from)
             .filter(|directory| directory.is_dir())
