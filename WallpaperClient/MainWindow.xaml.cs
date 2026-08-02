@@ -28,7 +28,6 @@ public partial class MainWindow : Window
         _settings = _settingsStore.Load();
         AutoStartCheckBox.IsChecked = _settings.StartWithWindows;
         OtherAppsMuteCheckBox.IsChecked = _settings.MuteWhenOtherAppOpen;
-        PerformanceComboBox.SelectedIndex = Math.Clamp(_settings.PerformanceMode, 0, 2);
         VolumeSlider.Value = Math.Clamp(_settings.Volume, 0, 100);
         _muted = VolumeSlider.Value == 0;
         _lastVolume = _muted ? 70 : (int)VolumeSlider.Value;
@@ -89,6 +88,23 @@ public partial class MainWindow : Window
         RuButton.Foreground = IsRussian ? System.Windows.Media.Brushes.White : System.Windows.Media.Brushes.Black;
         EnButton.Background = IsRussian ? System.Windows.Media.Brushes.Transparent : active;
         EnButton.Foreground = IsRussian ? System.Windows.Media.Brushes.Black : System.Windows.Media.Brushes.White;
+        AudioWavePath.Visibility = _muted || VolumeSlider.Value == 0 ? Visibility.Collapsed : Visibility.Visible;
+        AudioMuteSlashPath.Visibility = _muted || VolumeSlider.Value == 0 ? Visibility.Visible : Visibility.Collapsed;
+        UpdatePerformancePill();
+    }
+
+    private void UpdatePerformancePill()
+    {
+        var active = new SolidColorBrush(System.Windows.Media.Color.FromRgb(20, 20, 20));
+        var buttons = new[] { PerformanceEcoButton, PerformanceBalanceButton, PerformanceQualityButton };
+        for (var index = 0; index < buttons.Length; index++)
+        {
+            buttons[index].Background = index == _settings.PerformanceMode ? active : System.Windows.Media.Brushes.Transparent;
+            buttons[index].Foreground = index == _settings.PerformanceMode ? System.Windows.Media.Brushes.White : System.Windows.Media.Brushes.Black;
+        }
+        PerformanceEcoButton.Content = T("Eco", "Экономия");
+        PerformanceBalanceButton.Content = T("Balanced", "Баланс");
+        PerformanceQualityButton.Content = T("Quality", "Качество");
     }
 
     private void Settings_Click(object sender, RoutedEventArgs e)
@@ -97,6 +113,22 @@ public partial class MainWindow : Window
         SettingsPanel.Visibility = showSettings ? Visibility.Visible : Visibility.Collapsed;
         LibraryPanel.Visibility = showSettings ? Visibility.Collapsed : Visibility.Visible;
         ApplyLanguage();
+    }
+
+    private void AudioControl_MouseLeftButtonDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (e.OriginalSource is DependencyObject source && IsInside(source, MuteButton)) return;
+        if (AudioControl.ActualWidth <= 0) return;
+        var ratio = e.GetPosition(AudioControl).X / AudioControl.ActualWidth;
+        SetVolume((int)Math.Round(Math.Clamp(ratio, 0, 1) * 100));
+        e.Handled = true;
+    }
+
+    private static bool IsInside(DependencyObject child, DependencyObject ancestor)
+    {
+        for (DependencyObject? current = child; current is not null; current = VisualTreeHelper.GetParent(current))
+            if (ReferenceEquals(current, ancestor)) return true;
+        return false;
     }
 
     private void UpdateReady(string version)
@@ -260,14 +292,14 @@ public partial class MainWindow : Window
             _settingsStore.Save(_settings);
         }
     }
-    private void PerformanceChanged(object sender, SelectionChangedEventArgs e)
+    private void PerformanceMode_Click(object sender, RoutedEventArgs e)
     {
         if (_loading) return;
-        var mode = PerformanceComboBox.SelectedIndex;
-        if (mode < 0) return;
+        if (sender is not System.Windows.Controls.Button { Tag: string tag } || !int.TryParse(tag, out var mode)) return;
         WallpaperEngineInterop.SetPerformanceMode(mode);
         _settings = _settings with { PerformanceMode = mode };
         _settingsStore.Save(_settings);
+        UpdatePerformancePill();
         if (!string.IsNullOrWhiteSpace(_settings.WallpaperPath) && File.Exists(_settings.WallpaperPath))
             ApplyWallpaper(_settings.WallpaperPath, false);
     }
