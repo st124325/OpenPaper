@@ -448,6 +448,40 @@ pub extern "C" fn probe_direct_mp4_demuxer(file_path: *const c_char) -> i32 {
     }
 }
 
+/// Executes a bounded Media Source/Media Stream asynchronous demux test.
+/// The return value is the number of real MP4 samples observed; diagnostic
+/// details remain available through get_last_error when startup fails.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn probe_direct_mp4_event_loop(file_path: *const c_char) -> u32 {
+    if file_path.is_null() {
+        set_last_error("MP4 path is null.");
+        return 0;
+    }
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .ok()
+        .map(str::to_owned);
+    let Some(path) = path else {
+        set_last_error("MP4 path is not valid UTF-8.");
+        return 0;
+    };
+    match direct_mft::probe_direct_mp4_event_loop(&path, Duration::from_secs(3)) {
+        Ok(stats) if stats.samples > 0 => stats.samples,
+        Ok(stats) => {
+            set_last_error(&format!(
+                "MP4 direct event loop returned no samples (source events: {}, stream events: {}, started: {}).",
+                stats.source_events, stats.stream_events, stats.stream_started
+            ));
+            0
+        }
+        Err(error) => {
+            set_last_error(&error);
+            0
+        }
+    }
+}
+
 /// Reports whether the active native renderer has actually presented at least
 /// one GPU frame. This is deliberately stricter than successful initialization.
 #[no_mangle]
