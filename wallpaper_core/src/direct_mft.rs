@@ -16,6 +16,7 @@ use windows::{
         Foundation::{BOOL, HMODULE, HWND},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D10::ID3D10Multithread,
             Direct3D11::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
@@ -24,16 +25,18 @@ use windows::{
             Dxgi::IDXGIAdapter,
         },
         Media::MediaFoundation::{
-            IMFDXGIDeviceManager, IMFMediaSource, IMFMediaStream, IMFPresentationDescriptor,
-            IMFTransform, MEMediaSample, MENewStream, MEStreamStarted, MFCreateDXGIDeviceManager,
-            MFCreateSourceResolver, MFMediaType_Video, MFTEnumEx, MFVideoFormat_H264,
-            MFVideoFormat_HEVC, MFVideoFormat_NV12, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG,
-            MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+            IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaSource, IMFMediaStream,
+            IMFPresentationDescriptor, IMFShutdown, IMFTransform, MEMediaSample, MENewStream,
+            MEStreamStarted, METransformHaveOutput, METransformNeedInput,
+            MFCreateDXGIDeviceManager, MFCreateSourceResolver, MFMediaType_Video, MFTEnumEx,
+            MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFT_CATEGORY_VIDEO_DECODER,
+            MFT_ENUM_FLAG, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER,
             MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
             MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
             MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
-            MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-            MF_OBJECT_TYPE, MF_RESOLUTION_MEDIASOURCE, MF_SA_D3D11_AWARE,
+            MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+            MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_OBJECT_TYPE, MF_RESOLUTION_MEDIASOURCE,
+            MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
         },
         System::Com::CoTaskMemFree,
         UI::Shell::PropertiesSystem::IPropertyStore,
@@ -307,7 +310,7 @@ unsafe fn configure_decoder_input(
     };
     let mut activations = std::ptr::null_mut();
     let mut count = 0u32;
-    let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
+    let flags = decoder_enum_flags();
     let result = MFTEnumEx(
         MFT_CATEGORY_VIDEO_DECODER,
         flags,
@@ -321,10 +324,14 @@ unsafe fn configure_decoder_input(
     }
     let entries = std::slice::from_raw_parts(activations, count as usize);
     let accepted = entries.iter().flatten().any(|activation| {
-        activation
-            .ActivateObject::<IMFTransform>()
-            .and_then(|decoder| decoder.SetInputType(0, media_type, 0))
-            .is_ok()
+        let Ok(decoder) = activation.ActivateObject::<IMFTransform>() else {
+            return false;
+        };
+        let accepted = decoder.SetInputType(0, media_type, 0).is_ok();
+        if let Ok(shutdown) = decoder.cast::<IMFShutdown>() {
+            let _ = shutdown.Shutdown();
+        }
+        accepted
     });
     CoTaskMemFree(Some(activations.cast()));
     accepted
@@ -335,6 +342,7 @@ unsafe fn configure_decoder_input(
 /// manager or use a D3D device from a different pipeline.
 pub struct DirectDecoderSession {
     pub decoder: IMFTransform,
+    events: Option<IMFMediaEventGenerator>,
     pub(crate) device: ID3D11Device,
     pub(crate) context: ID3D11DeviceContext,
     pub(crate) manager: IMFDXGIDeviceManager,
@@ -354,6 +362,16 @@ impl DirectDecoderSession {
             self.manager.clone(),
             host,
         )
+    }
+}
+
+impl Drop for DirectDecoderSession {
+    fn drop(&mut self) {
+        unsafe {
+            if let Ok(shutdown) = self.decoder.cast::<IMFShutdown>() {
+                let _ = shutdown.Shutdown();
+            }
+        }
     }
 }
 
@@ -410,6 +428,7 @@ pub fn read_first_direct_video_sample(
                 }
             }
         }
+        let _ = source.Stop();
         let _ = source.Shutdown();
         sample.ok_or_else(|| {
             "Direct MP4 demuxer did not return a video sample before timeout.".into()
@@ -422,6 +441,9 @@ pub fn read_first_direct_video_sample(
 /// here can never leave user wallpaper playback without video.
 pub fn can_process_first_direct_mp4_sample(path: &str) -> Result<bool, String> {
     let session = create_gpu_decoder_session_for_mp4(path)?;
+    if session.events.is_some() {
+        return Err("Hardware MFT is asynchronous; use the event-driven native smoke test.".into());
+    }
     let sample = read_first_direct_video_sample(path, Duration::from_secs(3))?;
     unsafe {
         session
@@ -455,6 +477,9 @@ unsafe fn process_sample_to_nv12(
     session: &DirectDecoderSession,
     sample: &windows::Win32::Media::MediaFoundation::IMFSample,
 ) -> Result<windows::Win32::Media::MediaFoundation::IMFSample, String> {
+    if session.events.is_some() {
+        return Err("Hardware MFT is asynchronous; direct ProcessOutput is only valid after METransformHaveOutput.".into());
+    }
     session
         .decoder
         .ProcessInput(0, sample, 0)
@@ -498,7 +523,13 @@ pub fn run_native_mp4_smoke_test(
 ) -> Result<NativeSmokeStats, String> {
     unsafe {
         let session = create_gpu_decoder_session_for_mp4(path)?;
-        let mut presenter = session.create_presenter(host)?;
+        let skip_present =
+            std::env::var("OPENPAPER_NATIVE_SMOKE_DECODE_ONLY").as_deref() == Ok("1");
+        let mut presenter = if skip_present {
+            None
+        } else {
+            Some(session.create_presenter(host)?)
+        };
         let source = resolve_media_source(path)?;
         let descriptor = source
             .CreatePresentationDescriptor()
@@ -510,35 +541,94 @@ pub fn run_native_mp4_smoke_test(
 
         let deadline = Instant::now() + timeout;
         let mut stream: Option<IMFMediaStream> = None;
+        let mut compressed = VecDeque::with_capacity(8);
         let mut queue = VecDeque::with_capacity(3);
+        let mut pending_need_input = 0u32;
+        let mut stream_started = false;
+        let mut sample_request_pending = false;
         let mut stats = NativeSmokeStats::default();
         while Instant::now() < deadline && stats.input_samples < 180 {
+            if let Some(events) = session.events.as_ref() {
+                // An async decoder may continuously publish NeedInput events.
+                // Bound each pump iteration so the wall-clock watchdog and
+                // source/presenter queues always get CPU time.
+                for _ in 0..64 {
+                    let Ok(event) = events.GetEvent(MF_EVENT_FLAG_NO_WAIT) else {
+                        break;
+                    };
+                    match event.GetType().unwrap_or_default() {
+                        kind if kind == METransformNeedInput.0 as u32 => {
+                            pending_need_input = pending_need_input.saturating_add(1);
+                        }
+                        kind if kind == METransformHaveOutput.0 as u32 => {
+                            if let Some(frame) = try_process_output(&session)? {
+                                if queue.len() == 3 {
+                                    queue.pop_front();
+                                }
+                                queue.push_back(frame);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                while pending_need_input > 0 {
+                    let Some(sample) = compressed.pop_front() else {
+                        break;
+                    };
+                    session
+                        .decoder
+                        .ProcessInput(0, &sample, 0)
+                        .map_err(|e| format!("Async hardware MFT ProcessInput failed: {e}"))?;
+                    pending_need_input -= 1;
+                    stats.input_samples += 1;
+                }
+            }
+            while let Some(frame) = queue.pop_front() {
+                if let Some(presenter) = presenter.as_mut() {
+                    presenter.present(&frame)?;
+                }
+                stats.output_frames += 1;
+            }
             if let Some(active_stream) = stream.as_ref() {
                 match active_stream.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                     Ok(event) if event.GetType().ok() == Some(MEStreamStarted.0 as u32) => {
-                        active_stream
-                            .RequestSample(None::<&IUnknown>)
-                            .map_err(|e| format!("MP4 RequestSample: {e}"))?;
+                        stream_started = true;
                     }
                     Ok(event) if event.GetType().ok() == Some(MEMediaSample.0 as u32) => {
+                        sample_request_pending = false;
                         let value = event
                             .GetValue()
                             .map_err(|e| format!("MP4 sample event: {e}"))?;
                         let object = IUnknown::try_from(&value)
                             .map_err(|e| format!("MP4 sample object: {e}"))?;
                         let sample = object.cast().map_err(|e| format!("MP4 sample cast: {e}"))?;
-                        feed_and_collect_output(&session, &sample, &mut queue)?;
-                        stats.input_samples += 1;
-                        while let Some(frame) = queue.pop_front() {
-                            presenter.present(&frame)?;
-                            stats.output_frames += 1;
+                        if session.events.is_some() {
+                            compressed.push_back(sample);
+                        } else {
+                            feed_and_collect_output(&session, &sample, &mut queue)?;
+                            stats.input_samples += 1;
                         }
-                        active_stream
-                            .RequestSample(None::<&IUnknown>)
-                            .map_err(|e| format!("MP4 RequestSample: {e}"))?;
                     }
                     Ok(_) => {}
-                    Err(_) => thread::sleep(Duration::from_millis(2)),
+                    Err(_) => {}
+                }
+                if stream_started
+                    && !sample_request_pending
+                    && compressed.len() < 8
+                    && stats.input_samples < 180
+                {
+                    active_stream
+                        .RequestSample(None::<&IUnknown>)
+                        .map_err(|e| format!("MP4 RequestSample: {e}"))?;
+                    sample_request_pending = true;
+                }
+                if session.events.is_none() {
+                    while let Some(frame) = queue.pop_front() {
+                        if let Some(presenter) = presenter.as_mut() {
+                            presenter.present(&frame)?;
+                        }
+                        stats.output_frames += 1;
+                    }
                 }
             } else {
                 match source.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
@@ -554,6 +644,7 @@ pub fn run_native_mp4_smoke_test(
                     Err(_) => thread::sleep(Duration::from_millis(2)),
                 }
             }
+            thread::sleep(Duration::from_millis(1));
         }
         let _ = source.Shutdown();
         if stats.output_frames == 0 {
@@ -606,23 +697,44 @@ unsafe fn try_process_output(
     if info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 == 0 {
         return Err("Hardware MFT requires an application-owned output buffer; GPU surface allocation is the next compatibility path.".into());
     }
-    let output = MFT_OUTPUT_DATA_BUFFER {
-        dwStreamID: 0,
-        pSample: ManuallyDrop::new(None),
-        dwStatus: 0,
-        pEvents: ManuallyDrop::new(None),
-    };
-    let mut status = 0;
-    let mut outputs = [output];
-    let result = session.decoder.ProcessOutput(0, &mut outputs, &mut status);
-    let mut output = outputs.into_iter().next().expect("one output buffer");
-    let sample = ManuallyDrop::take(&mut output.pSample);
-    ManuallyDrop::drop(&mut output.pEvents);
-    match result {
-        Ok(()) => Ok(sample),
-        Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
-        Err(error) => Err(format!("Hardware MFT ProcessOutput failed: {error}")),
+    for _ in 0..2 {
+        let output = MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: ManuallyDrop::new(None),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        };
+        let mut status = 0;
+        let mut outputs = [output];
+        let result = session.decoder.ProcessOutput(0, &mut outputs, &mut status);
+        let mut output = outputs.into_iter().next().expect("one output buffer");
+        let sample = ManuallyDrop::take(&mut output.pSample);
+        ManuallyDrop::drop(&mut output.pEvents);
+        match result {
+            Ok(()) => return Ok(sample),
+            Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+            Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                select_current_nv12_output_type(&session.decoder)?;
+            }
+            Err(error) => return Err(format!("Hardware MFT ProcessOutput failed: {error}")),
+        }
     }
+    Err("Hardware MFT repeatedly changed its output stream type.".into())
+}
+
+unsafe fn select_current_nv12_output_type(decoder: &IMFTransform) -> Result<(), String> {
+    for index in 0..32 {
+        let candidate = match decoder.GetOutputAvailableType(0, index) {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        if candidate.GetGUID(&MF_MT_SUBTYPE).ok() == Some(MFVideoFormat_NV12) {
+            return decoder
+                .SetOutputType(0, &candidate, 0)
+                .map_err(|e| format!("Could not renegotiate NV12 decoder output: {e}"));
+        }
+    }
+    Err("Decoder stream changed but exposed no NV12 output type.".into())
 }
 
 /// Creates a D3D11 device and binds its Media Foundation device manager to an
@@ -665,8 +777,21 @@ pub fn create_gpu_decoder_session_for_mp4(path: &str) -> Result<DirectDecoderSes
         }
         let (device, context, manager) = create_decoder_device_manager()?;
         let decoder = activate_gpu_decoder(subtype, &video_type, &manager)?;
+        let attributes = decoder
+            .GetAttributes()
+            .map_err(|e| format!("Hardware MFT attributes: {e}"))?;
+        let events = if attributes.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0 {
+            Some(
+                decoder
+                    .cast()
+                    .map_err(|e| format!("Async hardware MFT event generator: {e}"))?,
+            )
+        } else {
+            None
+        };
         Ok(DirectDecoderSession {
             decoder,
+            events,
             device,
             context,
             manager,
@@ -692,6 +817,10 @@ unsafe fn create_decoder_device_manager(
     .map_err(|e| format!("D3D11 hardware device creation failed: {e}"))?;
     let device = device.ok_or_else(|| "D3D11 returned no device.".to_string())?;
     let context = context.ok_or_else(|| "D3D11 returned no context.".to_string())?;
+    let multithread: ID3D10Multithread = device
+        .cast()
+        .map_err(|e| format!("D3D11 multithread protection is unavailable: {e}"))?;
+    let _ = multithread.SetMultithreadProtected(true);
     let mut token = 0;
     let mut manager = None;
     MFCreateDXGIDeviceManager(&mut token, &mut manager)
@@ -715,7 +844,7 @@ unsafe fn activate_gpu_decoder(
     };
     let mut activations = std::ptr::null_mut();
     let mut count = 0u32;
-    let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
+    let flags = decoder_enum_flags();
     MFTEnumEx(
         MFT_CATEGORY_VIDEO_DECODER,
         flags,
@@ -731,29 +860,46 @@ unsafe fn activate_gpu_decoder(
     let entries = std::slice::from_raw_parts(activations, count as usize);
     let decoder = entries.iter().flatten().find_map(|activation| {
         let decoder = activation.ActivateObject::<IMFTransform>().ok()?;
-        decoder
-            .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
-            .ok()?;
-        decoder.SetInputType(0, media_type, 0).ok()?;
-        let mut output_index = 0;
-        let output_type = loop {
-            let candidate = decoder.GetOutputAvailableType(0, output_index).ok()?;
-            if candidate.GetGUID(&MF_MT_SUBTYPE).ok() == Some(MFVideoFormat_NV12) {
-                break candidate;
-            }
-            output_index += 1;
-            if output_index >= 32 {
+        let configured = (|| -> Option<()> {
+            let attributes = decoder.GetAttributes().ok()?;
+            if attributes.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) == 0 {
                 return None;
             }
-        };
-        decoder.SetOutputType(0, &output_type, 0).ok()?;
-        decoder
-            .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
-            .ok()?;
-        decoder
-            .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
-            .ok()?;
-        Some(decoder)
+            if attributes.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0 {
+                attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1).ok()?;
+            }
+            decoder
+                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+                .ok()?;
+            decoder.SetInputType(0, media_type, 0).ok()?;
+            let mut output_index = 0;
+            let output_type = loop {
+                let candidate = decoder.GetOutputAvailableType(0, output_index).ok()?;
+                if candidate.GetGUID(&MF_MT_SUBTYPE).ok() == Some(MFVideoFormat_NV12) {
+                    break candidate;
+                }
+                output_index += 1;
+                if output_index >= 32 {
+                    return None;
+                }
+            };
+            decoder.SetOutputType(0, &output_type, 0).ok()?;
+            decoder
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+                .ok()?;
+            decoder
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+                .ok()?;
+            Some(())
+        })();
+        if configured.is_some() {
+            Some(decoder)
+        } else {
+            if let Ok(shutdown) = decoder.cast::<IMFShutdown>() {
+                let _ = shutdown.Shutdown();
+            }
+            None
+        }
     });
     CoTaskMemFree(Some(activations.cast()));
     decoder.ok_or_else(|| {
@@ -768,7 +914,7 @@ unsafe fn has_decoder_for_subtype(subtype: windows::core::GUID) -> bool {
     };
     let mut activations = std::ptr::null_mut();
     let mut count = 0u32;
-    let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
+    let flags = decoder_enum_flags();
     if MFTEnumEx(
         MFT_CATEGORY_VIDEO_DECODER,
         flags,
@@ -784,13 +930,25 @@ unsafe fn has_decoder_for_subtype(subtype: windows::core::GUID) -> bool {
     }
     let entries = std::slice::from_raw_parts(activations, count as usize);
     let supported = entries.iter().flatten().any(|activation| {
-        activation
-            .ActivateObject::<IMFTransform>()
+        let Ok(transform) = activation.ActivateObject::<IMFTransform>() else {
+            return false;
+        };
+        let supported = transform
+            .GetAttributes()
             .ok()
-            .and_then(|transform| transform.GetAttributes().ok())
             .and_then(|attributes| attributes.GetUINT32(&MF_SA_D3D11_AWARE).ok())
-            .is_some_and(|aware| aware != 0)
+            .is_some_and(|aware| aware != 0);
+        if let Ok(shutdown) = transform.cast::<IMFShutdown>() {
+            let _ = shutdown.Shutdown();
+        }
+        supported
     });
     CoTaskMemFree(Some(activations.cast()));
     supported
+}
+
+fn decoder_enum_flags() -> MFT_ENUM_FLAG {
+    // Microsoft's H.264/HEVC decoder is commonly registered as a regular MFT
+    // and activates DXVA only after receiving an IMFDXGIDeviceManager.
+    MFT_ENUM_FLAG(MFT_ENUM_FLAG_ALL.0 | MFT_ENUM_FLAG_SORTANDFILTER.0)
 }
