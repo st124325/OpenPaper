@@ -595,6 +595,45 @@ pub extern "C" fn can_decode_direct_mp4_sample_to_nv12(file_path: *const c_char)
     }
 }
 
+/// End-to-end diagnostic for the experimental native path: decode one MP4
+/// sample to an NV12 GPU surface and present it to the wallpaper host window.
+/// Normal playback still remains on libVLC until this probe is proven stable.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn can_present_direct_mp4_sample(file_path: *const c_char) -> bool {
+    if file_path.is_null() {
+        set_last_error("MP4 path is null.");
+        return false;
+    }
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .ok()
+        .map(str::to_owned);
+    let Some(path) = path else {
+        set_last_error("MP4 path is not valid UTF-8.");
+        return false;
+    };
+    let host = engine()
+        .lock()
+        .ok()
+        .map(|state| state.host_window)
+        .filter(|host| *host != 0);
+    let Some(host) = host else {
+        set_last_error("Wallpaper host window is not initialized.");
+        return false;
+    };
+    match direct_mft::decode_and_present_first_direct_mp4_sample(
+        &path,
+        windows::Win32::Foundation::HWND(host as _),
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            set_last_error(&error);
+            false
+        }
+    }
+}
+
 /// Reports whether the active native renderer has actually presented at least
 /// one GPU frame. This is deliberately stricter than successful initialization.
 #[no_mangle]
