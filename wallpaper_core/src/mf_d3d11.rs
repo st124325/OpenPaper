@@ -212,12 +212,25 @@ impl IMFSourceReaderCallback_Impl for AsyncReaderCallback_Impl {
             // consumed this one. Never block a Media Foundation callback.
             return Ok(());
         }
-        // A type-change callback has no sample. Ask the render worker to
-        // query the new format and request the next sample only after this
-        // callback returns; re-entrant ReadSample calls are rejected by some
-        // hardware MFTs.
+        // Keep Source Reader calls on its callback MTA. It is not safe to
+        // query the media type on the render thread and then issue ReadSample
+        // from a different thread while a callback is in flight.
         if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32 != 0 {
+            let reader = self.state.reader.lock().ok().and_then(|slot| slot.clone());
+            let Some(reader) = reader else {
+                let _ = self.state.events.try_send(DecodeEvent::Error);
+                return Ok(());
+            };
+            if unsafe { inspect_renegotiated_video_format(&reader) }.is_err() {
+                let _ = self.state.events.try_send(DecodeEvent::Error);
+                return Ok(());
+            }
+            if unsafe { configure_dxva_nv12_output(&reader) }.is_err() {
+                let _ = self.state.events.try_send(DecodeEvent::Error);
+                return Ok(());
+            }
             let _ = self.state.events.try_send(DecodeEvent::FormatChanged);
+            self.state.request_next()?;
         } else {
             let _ = self.state.events.try_send(DecodeEvent::Error);
         }
@@ -424,10 +437,9 @@ unsafe fn run_async_renderer(
                     })?;
                 }
                 Ok(DecodeEvent::FormatChanged) => {
-                    renegotiate_video_format(&mut pipeline)?;
-                    callback_state.request_next().map_err(|error| {
-                        format!("Could not continue after native format change: {error}")
-                    })?;
+                    // The callback already validated NV12 and requested the
+                    // next sample. Drop size-dependent D3D11 state here.
+                    pipeline.processor = None;
                 }
                 Ok(DecodeEvent::EndOfStream) => {
                     reached_end = true;
@@ -452,13 +464,9 @@ unsafe fn run_async_renderer(
     }
 }
 
-/// Handles MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED outside the callback.
-/// Source Reader can renegotiate after its first asynchronous request; the
-/// native path accepts only GPU-friendly NV12 and recreates cached processor
-/// state so dimensions cannot be inherited from the previous media type.
-unsafe fn renegotiate_video_format(pipeline: &mut NativeMp4Pipeline) -> Result<(), String> {
-    let media_type = pipeline
-        .reader
+/// Validates a format reported by MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.
+unsafe fn inspect_renegotiated_video_format(reader: &IMFSourceReader) -> Result<(), String> {
+    let media_type = reader
         .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
         .map_err(|error| format!("Could not read the renegotiated media type: {error}"))?;
     let major = media_type
@@ -483,9 +491,28 @@ unsafe fn renegotiate_video_format(pipeline: &mut NativeMp4Pipeline) -> Result<(
     if width == 0 || height == 0 {
         return Err("Renegotiated video type has an invalid zero frame size.".into());
     }
-    // The next sample's texture must match the newly reported dimensions.
-    pipeline.processor = None;
     Ok(())
+}
+
+/// Re-applies the GPU-friendly output type after a decoder transform changes
+/// its format. This is valid after OnReadSample because no sample request is
+/// pending at that point.
+unsafe fn configure_dxva_nv12_output(reader: &IMFSourceReader) -> Result<(), String> {
+    let media_type = MFCreateMediaType()
+        .map_err(|error| format!("Could not create a renegotiated NV12 media type: {error}"))?;
+    media_type
+        .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+        .map_err(|error| format!("Could not set renegotiated video major type: {error}"))?;
+    media_type
+        .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)
+        .map_err(|error| format!("Could not set renegotiated NV12 subtype: {error}"))?;
+    reader
+        .SetCurrentMediaType(
+            MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+            None,
+            &media_type,
+        )
+        .map_err(|error| format!("Could not reconfigure the DXVA NV12 output: {error}"))
 }
 
 unsafe fn create_video_processor_resources(

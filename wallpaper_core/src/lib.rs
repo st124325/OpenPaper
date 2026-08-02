@@ -1,6 +1,7 @@
 //! Minimal, C-ABI-stable Windows wallpaper core.
 //! Playback is provided by dynamically loaded libVLC (LGPL-2.1-or-later).
 
+mod direct_mft;
 mod mf_d3d11;
 mod vlc;
 
@@ -411,6 +412,13 @@ pub extern "C" fn is_native_renderer_available() -> bool {
         .lock()
         .map(|state| state.d3d11_media_foundation_available)
         .unwrap_or(false)
+}
+
+/// Reports whether a direct D3D11-aware H.264/HEVC hardware MFT is available
+/// for the next native backend. This does not claim MP4 playback readiness.
+#[no_mangle]
+pub extern "C" fn is_direct_mft_decoder_available() -> bool {
+    direct_mft::has_d3d11_hardware_decoder()
 }
 
 /// Reports whether the active native renderer has actually presented at least
