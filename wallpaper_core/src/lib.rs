@@ -2,6 +2,7 @@
 //! Playback is provided by dynamically loaded libVLC (LGPL-2.1-or-later).
 
 mod direct_mft;
+#[allow(dead_code)]
 mod mf_d3d11;
 mod vlc;
 
@@ -241,7 +242,7 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
     if let Some(renderer) = state.native_renderer.take() {
         renderer.stop();
     }
-    let native_renderer = None;
+    let native_renderer: Option<mf_d3d11::NativeMp4Renderer> = None;
     let show_vlc_video = true;
     let player = match unsafe {
         vlc::VlcPlayer::start(
