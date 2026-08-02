@@ -4,6 +4,7 @@
 //! H.264/HEVC samples, while MP4 demuxing is the next separate pipeline layer.
 
 use std::{
+    collections::VecDeque,
     mem::ManuallyDrop,
     thread,
     time::{Duration, Instant},
@@ -31,8 +32,8 @@ use windows::{
             MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
             MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
             MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
-            MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_OBJECT_TYPE, MF_RESOLUTION_MEDIASOURCE,
-            MF_SA_D3D11_AWARE,
+            MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+            MF_OBJECT_TYPE, MF_RESOLUTION_MEDIASOURCE, MF_SA_D3D11_AWARE,
         },
         System::Com::CoTaskMemFree,
         UI::Shell::PropertiesSystem::IPropertyStore,
@@ -479,6 +480,149 @@ unsafe fn process_sample_to_nv12(
     ManuallyDrop::drop(&mut output.pEvents);
     result.map_err(|e| format!("Hardware MFT has no NV12 output yet: {e}"))?;
     sample.ok_or_else(|| "Hardware MFT returned success without an NV12 output sample.".into())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeSmokeStats {
+    pub input_samples: u32,
+    pub output_frames: u32,
+}
+
+/// Bounded end-to-end smoke test for the direct backend. It continuously
+/// requests MP4 video samples, feeds the hardware MFT, keeps a three-frame
+/// GPU queue for back-pressure, and presents every decoded NV12 frame.
+pub fn run_native_mp4_smoke_test(
+    path: &str,
+    host: HWND,
+    timeout: Duration,
+) -> Result<NativeSmokeStats, String> {
+    unsafe {
+        let session = create_gpu_decoder_session_for_mp4(path)?;
+        let mut presenter = session.create_presenter(host)?;
+        let source = resolve_media_source(path)?;
+        let descriptor = source
+            .CreatePresentationDescriptor()
+            .map_err(|e| format!("MP4 presentation descriptor: {e}"))?;
+        select_only_video_stream(&descriptor)?;
+        source
+            .Start(&descriptor, std::ptr::null(), &PROPVARIANT::default())
+            .map_err(|e| format!("MP4 source start: {e}"))?;
+
+        let deadline = Instant::now() + timeout;
+        let mut stream: Option<IMFMediaStream> = None;
+        let mut queue = VecDeque::with_capacity(3);
+        let mut stats = NativeSmokeStats::default();
+        while Instant::now() < deadline && stats.input_samples < 180 {
+            if let Some(active_stream) = stream.as_ref() {
+                match active_stream.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                    Ok(event) if event.GetType().ok() == Some(MEStreamStarted.0 as u32) => {
+                        active_stream
+                            .RequestSample(None::<&IUnknown>)
+                            .map_err(|e| format!("MP4 RequestSample: {e}"))?;
+                    }
+                    Ok(event) if event.GetType().ok() == Some(MEMediaSample.0 as u32) => {
+                        let value = event
+                            .GetValue()
+                            .map_err(|e| format!("MP4 sample event: {e}"))?;
+                        let object = IUnknown::try_from(&value)
+                            .map_err(|e| format!("MP4 sample object: {e}"))?;
+                        let sample = object.cast().map_err(|e| format!("MP4 sample cast: {e}"))?;
+                        feed_and_collect_output(&session, &sample, &mut queue)?;
+                        stats.input_samples += 1;
+                        while let Some(frame) = queue.pop_front() {
+                            presenter.present(&frame)?;
+                            stats.output_frames += 1;
+                        }
+                        active_stream
+                            .RequestSample(None::<&IUnknown>)
+                            .map_err(|e| format!("MP4 RequestSample: {e}"))?;
+                    }
+                    Ok(_) => {}
+                    Err(_) => thread::sleep(Duration::from_millis(2)),
+                }
+            } else {
+                match source.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                    Ok(event) if event.GetType().ok() == Some(MENewStream.0 as u32) => {
+                        let value = event
+                            .GetValue()
+                            .map_err(|e| format!("MP4 stream event: {e}"))?;
+                        let object = IUnknown::try_from(&value)
+                            .map_err(|e| format!("MP4 stream object: {e}"))?;
+                        stream = Some(object.cast().map_err(|e| format!("MP4 stream cast: {e}"))?);
+                    }
+                    Ok(_) => {}
+                    Err(_) => thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        }
+        let _ = source.Shutdown();
+        if stats.output_frames == 0 {
+            return Err(format!(
+                "Native smoke test decoded no frames after {} input samples.",
+                stats.input_samples
+            ));
+        }
+        Ok(stats)
+    }
+}
+
+unsafe fn feed_and_collect_output(
+    session: &DirectDecoderSession,
+    sample: &windows::Win32::Media::MediaFoundation::IMFSample,
+    queue: &mut VecDeque<windows::Win32::Media::MediaFoundation::IMFSample>,
+) -> Result<(), String> {
+    match session.decoder.ProcessInput(0, sample, 0) {
+        Ok(()) => {}
+        Err(error) if error.code() == MF_E_NOTACCEPTING => drain_decoder_output(session, queue)?,
+        Err(error) => return Err(format!("Hardware MFT ProcessInput failed: {error}")),
+    }
+    drain_decoder_output(session, queue)
+}
+
+unsafe fn drain_decoder_output(
+    session: &DirectDecoderSession,
+    queue: &mut VecDeque<windows::Win32::Media::MediaFoundation::IMFSample>,
+) -> Result<(), String> {
+    loop {
+        match try_process_output(session)? {
+            Some(frame) => {
+                if queue.len() == 3 {
+                    queue.pop_front();
+                }
+                queue.push_back(frame);
+            }
+            None => return Ok(()),
+        }
+    }
+}
+
+unsafe fn try_process_output(
+    session: &DirectDecoderSession,
+) -> Result<Option<windows::Win32::Media::MediaFoundation::IMFSample>, String> {
+    let info = session
+        .decoder
+        .GetOutputStreamInfo(0)
+        .map_err(|e| format!("Hardware MFT output stream info: {e}"))?;
+    if info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 == 0 {
+        return Err("Hardware MFT requires an application-owned output buffer; GPU surface allocation is the next compatibility path.".into());
+    }
+    let output = MFT_OUTPUT_DATA_BUFFER {
+        dwStreamID: 0,
+        pSample: ManuallyDrop::new(None),
+        dwStatus: 0,
+        pEvents: ManuallyDrop::new(None),
+    };
+    let mut status = 0;
+    let mut outputs = [output];
+    let result = session.decoder.ProcessOutput(0, &mut outputs, &mut status);
+    let mut output = outputs.into_iter().next().expect("one output buffer");
+    let sample = ManuallyDrop::take(&mut output.pSample);
+    ManuallyDrop::drop(&mut output.pEvents);
+    match result {
+        Ok(()) => Ok(sample),
+        Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+        Err(error) => Err(format!("Hardware MFT ProcessOutput failed: {error}")),
+    }
 }
 
 /// Creates a D3D11 device and binds its Media Foundation device manager to an

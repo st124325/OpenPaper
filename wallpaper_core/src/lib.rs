@@ -613,6 +613,51 @@ pub extern "C" fn can_present_direct_mp4_sample(file_path: *const c_char) -> boo
     }
 }
 
+/// Runs the bounded native MP4 smoke test. Returns the number of presented
+/// GPU frames; detailed errors are available through get_last_error.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn run_native_mp4_smoke_test(file_path: *const c_char) -> u32 {
+    if file_path.is_null() {
+        set_last_error("MP4 path is null.");
+        return 0;
+    }
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .ok()
+        .map(str::to_owned);
+    let Some(path) = path else {
+        set_last_error("MP4 path is not valid UTF-8.");
+        return 0;
+    };
+    let host = engine()
+        .lock()
+        .ok()
+        .map(|state| state.host_window)
+        .filter(|host| *host != 0);
+    let Some(host) = host else {
+        set_last_error("Wallpaper host window is not initialized.");
+        return 0;
+    };
+    match direct_mft::run_native_mp4_smoke_test(
+        &path,
+        windows::Win32::Foundation::HWND(host as _),
+        Duration::from_secs(8),
+    ) {
+        Ok(stats) => {
+            set_last_error(&format!(
+                "Native smoke test passed: {} input samples, {} presented GPU frames.",
+                stats.input_samples, stats.output_frames
+            ));
+            stats.output_frames
+        }
+        Err(error) => {
+            set_last_error(&error);
+            0
+        }
+    }
+}
+
 /// Reports whether the active native renderer has actually presented at least
 /// one GPU frame. This is deliberately stricter than successful initialization.
 #[no_mangle]
