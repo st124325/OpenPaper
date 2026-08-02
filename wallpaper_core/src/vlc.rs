@@ -101,10 +101,11 @@ impl VlcPlayer {
             CString::new("--no-video-title-show").unwrap(),
             CString::new("--no-osd").unwrap(),
             CString::new("--no-media-library").unwrap(),
-            // Global loop policy covers every supported input type. The
-            // per-media :input-repeat option below remains as a second line
-            // of defence for VLC modules that do not inherit this setting.
-            CString::new("--repeat").unwrap(),
+            // `--repeat` repeats a playlist item in VLC's UI. libVLC embeds
+            // one media item without that playlist controller, so it can
+            // still stop at EOF. Input repeat is owned by the demux/input
+            // layer and works for MP4, GIF and WebP alike.
+            CString::new("--input-repeat=-1").unwrap(),
             // Keep D3D11VA decoder surfaces and the presentation swap chain
             // in the same D3D11 pipeline. Without an explicit D3D11 vout,
             // VLC may choose a different renderer and add a GPU/CPU copy.

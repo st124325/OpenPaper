@@ -62,7 +62,7 @@ struct NativeMp4Pipeline {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     _manager: IMFDXGIDeviceManager,
-    reader: IMFSourceReader,
+    reader: Option<IMFSourceReader>,
     swap_chain: IDXGISwapChain1,
     processor: Option<VideoProcessorResources>,
 }
@@ -397,7 +397,12 @@ unsafe fn run_async_renderer(
                 return Err(error);
             }
         };
-        callback_state.attach_reader(&pipeline.reader);
+        callback_state.attach_reader(
+            pipeline
+                .reader
+                .as_ref()
+                .expect("source-reader pipeline always owns its reader"),
+        );
         if let Err(error) = callback_state.request_next() {
             callback_state.detach_reader();
             if let Some(sender) = ready_tx.take() {
@@ -415,9 +420,9 @@ unsafe fn run_async_renderer(
         let mut reached_end = false;
         loop {
             if stop.load(Ordering::Acquire) {
-                let _ = pipeline
-                    .reader
-                    .Flush(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32);
+                if let Some(reader) = pipeline.reader.as_ref() {
+                    let _ = reader.Flush(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32);
+                }
                 break;
             }
             match events_rx.recv_timeout(Duration::from_millis(100)) {
@@ -861,9 +866,71 @@ unsafe fn create_pipeline(
             device,
             context,
             _manager: manager,
-            reader,
+            reader: Some(reader),
             swap_chain,
             processor: None,
         })
+    }
+}
+
+/// Presenter shared by the direct Media Source/MFT backend. It accepts an
+/// NV12 DXGI sample produced by any decoder bound to the same D3D11 device.
+/// No CPU copy is introduced between decode and the desktop swap chain.
+pub(crate) struct ExternalNv12Presenter {
+    pipeline: NativeMp4Pipeline,
+}
+
+impl ExternalNv12Presenter {
+    pub(crate) unsafe fn new(
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        manager: IMFDXGIDeviceManager,
+        host: HWND,
+    ) -> Result<Self, String> {
+        let dxgi_device: IDXGIDevice = device
+            .cast()
+            .map_err(|error| format!("Could not query IDXGIDevice: {error}"))?;
+        let adapter = dxgi_device
+            .GetAdapter()
+            .map_err(|error| format!("Could not get the DXGI adapter: {error}"))?;
+        let factory: IDXGIFactory2 = adapter
+            .GetParent()
+            .map_err(|error| format!("Could not get the DXGI factory: {error}"))?;
+        let description = DXGI_SWAP_CHAIN_DESC1 {
+            Width: 0,
+            Height: 0,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            Flags: 0,
+        };
+        let swap_chain = factory
+            .CreateSwapChainForHwnd(&device, host, &description, None, None::<&IDXGIOutput>)
+            .map_err(|error| format!("Could not create direct D3D11 swap chain: {error}"))?;
+        Ok(Self {
+            pipeline: NativeMp4Pipeline {
+                device,
+                context,
+                _manager: manager,
+                reader: None,
+                swap_chain,
+                processor: None,
+            },
+        })
+    }
+
+    pub(crate) unsafe fn present(
+        &mut self,
+        sample: &windows::Win32::Media::MediaFoundation::IMFSample,
+    ) -> Result<(), String> {
+        present_nv12_sample(&mut self.pipeline, sample)
     }
 }

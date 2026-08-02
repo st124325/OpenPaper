@@ -566,6 +566,35 @@ pub extern "C" fn can_process_direct_mp4_sample(file_path: *const c_char) -> boo
     }
 }
 
+/// Executes one native decode output pull and verifies that the result is an
+/// NV12 sample supplied by the hardware MFT. Presentation is kept separate.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn can_decode_direct_mp4_sample_to_nv12(file_path: *const c_char) -> bool {
+    if file_path.is_null() {
+        set_last_error("MP4 path is null.");
+        return false;
+    }
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .ok()
+        .map(str::to_owned);
+    let Some(path) = path else {
+        set_last_error("MP4 path is not valid UTF-8.");
+        return false;
+    };
+    match direct_mft::decode_first_direct_mp4_sample_to_nv12(&path) {
+        Ok(sample) => {
+            drop(sample);
+            true
+        }
+        Err(error) => {
+            set_last_error(&error);
+            false
+        }
+    }
+}
+
 /// Reports whether the active native renderer has actually presented at least
 /// one GPU frame. This is deliberately stricter than successful initialization.
 #[no_mangle]

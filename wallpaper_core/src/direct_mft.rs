@@ -4,6 +4,7 @@
 //! H.264/HEVC samples, while MP4 demuxing is the next separate pipeline layer.
 
 use std::{
+    mem::ManuallyDrop,
     thread,
     time::{Duration, Instant},
 };
@@ -11,7 +12,7 @@ use std::{
 use windows::{
     core::{IUnknown, Interface, HSTRING, PCWSTR, PROPVARIANT},
     Win32::{
-        Foundation::{BOOL, HMODULE},
+        Foundation::{BOOL, HMODULE, HWND},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
@@ -25,11 +26,13 @@ use windows::{
             IMFDXGIDeviceManager, IMFMediaSource, IMFMediaStream, IMFPresentationDescriptor,
             IMFTransform, MEMediaSample, MENewStream, MEStreamStarted, MFCreateDXGIDeviceManager,
             MFCreateSourceResolver, MFMediaType_Video, MFTEnumEx, MFVideoFormat_H264,
-            MFVideoFormat_HEVC, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
-            MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-            MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
-            MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-            MF_OBJECT_TYPE, MF_RESOLUTION_MEDIASOURCE, MF_SA_D3D11_AWARE,
+            MFVideoFormat_HEVC, MFVideoFormat_NV12, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG,
+            MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+            MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+            MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+            MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
+            MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_OBJECT_TYPE, MF_RESOLUTION_MEDIASOURCE,
+            MF_SA_D3D11_AWARE,
         },
         System::Com::CoTaskMemFree,
         UI::Shell::PropertiesSystem::IPropertyStore,
@@ -331,9 +334,26 @@ unsafe fn configure_decoder_input(
 /// manager or use a D3D device from a different pipeline.
 pub struct DirectDecoderSession {
     pub decoder: IMFTransform,
-    _device: ID3D11Device,
-    _context: ID3D11DeviceContext,
-    _manager: IMFDXGIDeviceManager,
+    pub(crate) device: ID3D11Device,
+    pub(crate) context: ID3D11DeviceContext,
+    pub(crate) manager: IMFDXGIDeviceManager,
+}
+
+impl DirectDecoderSession {
+    /// Creates a zero-copy NV12 presenter on the same D3D11 device as the
+    /// decoder. Using one device is mandatory for a GPU texture to be passed
+    /// directly into the Video Processor.
+    pub(crate) unsafe fn create_presenter(
+        &self,
+        host: HWND,
+    ) -> Result<crate::mf_d3d11::ExternalNv12Presenter, String> {
+        crate::mf_d3d11::ExternalNv12Presenter::new(
+            self.device.clone(),
+            self.context.clone(),
+            self.manager.clone(),
+            host,
+        )
+    }
 }
 
 /// Reads one compressed video sample directly from the Media Source. It is
@@ -411,6 +431,56 @@ pub fn can_process_first_direct_mp4_sample(path: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Pulls an NV12 decoder-owned sample after input has been accepted. Hardware
+/// decoders normally provide the output sample themselves; forcing a system
+/// memory buffer here would defeat zero-copy presentation.
+pub fn decode_first_direct_mp4_sample_to_nv12(
+    path: &str,
+) -> Result<windows::Win32::Media::MediaFoundation::IMFSample, String> {
+    let session = create_gpu_decoder_session_for_mp4(path)?;
+    let sample = read_first_direct_video_sample(path, Duration::from_secs(3))?;
+    unsafe { process_sample_to_nv12(&session, &sample) }
+}
+
+pub fn decode_and_present_first_direct_mp4_sample(path: &str, host: HWND) -> Result<(), String> {
+    let session = create_gpu_decoder_session_for_mp4(path)?;
+    let mut presenter = unsafe { session.create_presenter(host)? };
+    let sample = read_first_direct_video_sample(path, Duration::from_secs(3))?;
+    let nv12 = unsafe { process_sample_to_nv12(&session, &sample)? };
+    unsafe { presenter.present(&nv12) }
+}
+
+unsafe fn process_sample_to_nv12(
+    session: &DirectDecoderSession,
+    sample: &windows::Win32::Media::MediaFoundation::IMFSample,
+) -> Result<windows::Win32::Media::MediaFoundation::IMFSample, String> {
+    session
+        .decoder
+        .ProcessInput(0, sample, 0)
+        .map_err(|e| format!("Hardware MFT rejected the first MP4 sample: {e}"))?;
+    let info = session
+        .decoder
+        .GetOutputStreamInfo(0)
+        .map_err(|e| format!("Hardware MFT output stream info: {e}"))?;
+    if info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 == 0 {
+        return Err("Hardware MFT requires an application-owned output buffer; GPU surface allocation is the next compatibility path.".into());
+    }
+    let output = MFT_OUTPUT_DATA_BUFFER {
+        dwStreamID: 0,
+        pSample: ManuallyDrop::new(None),
+        dwStatus: 0,
+        pEvents: ManuallyDrop::new(None),
+    };
+    let mut status = 0;
+    let mut outputs = [output];
+    let result = session.decoder.ProcessOutput(0, &mut outputs, &mut status);
+    let mut output = outputs.into_iter().next().expect("one output buffer");
+    let sample = ManuallyDrop::take(&mut output.pSample);
+    ManuallyDrop::drop(&mut output.pEvents);
+    result.map_err(|e| format!("Hardware MFT has no NV12 output yet: {e}"))?;
+    sample.ok_or_else(|| "Hardware MFT returned success without an NV12 output sample.".into())
+}
+
 /// Creates a D3D11 device and binds its Media Foundation device manager to an
 /// MFT which accepts the compressed video type from this MP4. The session is
 /// ready for ProcessInput/ProcessOutput; demuxed samples will be connected in
@@ -453,9 +523,9 @@ pub fn create_gpu_decoder_session_for_mp4(path: &str) -> Result<DirectDecoderSes
         let decoder = activate_gpu_decoder(subtype, &video_type, &manager)?;
         Ok(DirectDecoderSession {
             decoder,
-            _device: device,
-            _context: context,
-            _manager: manager,
+            device,
+            context,
+            manager,
         })
     }
 }
@@ -521,6 +591,18 @@ unsafe fn activate_gpu_decoder(
             .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
             .ok()?;
         decoder.SetInputType(0, media_type, 0).ok()?;
+        let mut output_index = 0;
+        let output_type = loop {
+            let candidate = decoder.GetOutputAvailableType(0, output_index).ok()?;
+            if candidate.GetGUID(&MF_MT_SUBTYPE).ok() == Some(MFVideoFormat_NV12) {
+                break candidate;
+            }
+            output_index += 1;
+            if output_index >= 32 {
+                return None;
+            }
+        };
+        decoder.SetOutputType(0, &output_type, 0).ok()?;
         decoder
             .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
             .ok()?;
