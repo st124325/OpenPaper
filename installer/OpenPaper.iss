@@ -1,5 +1,5 @@
 #define MyAppName "OpenPaper"
-#define MyAppVersion "0.0.14"
+#define MyAppVersion "0.0.15"
 #define MyAppPublisher "OpenPaper"
 #define MyAppExeName "OpenPaper.exe"
 
