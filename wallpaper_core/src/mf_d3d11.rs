@@ -65,6 +65,16 @@ use windows::{
 static MEDIA_FOUNDATION_STARTED: OnceLock<bool> = OnceLock::new();
 static HARDWARE_PIPELINE_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
+/// Result of submitting one decoded GPU surface to the desktop swap chain.
+/// A dropped frame is not an error: the decoder should keep running, but the
+/// caller must not count it as visible or complete the first-frame handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PresentOutcome {
+    Presented,
+    DroppedFrameLatency,
+    DroppedCompositorBusy,
+}
+
 struct NativeMp4Pipeline {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -498,8 +508,9 @@ unsafe fn run_async_renderer(
                     if stop.load(Ordering::Acquire) {
                         continue;
                     }
-                    present_nv12_sample(&mut pipeline, &sample)?;
-                    frames_presented.fetch_add(1, Ordering::Release);
+                    if present_nv12_sample(&mut pipeline, &sample)? == PresentOutcome::Presented {
+                        frames_presented.fetch_add(1, Ordering::Release);
+                    }
                     callback_state.request_next().map_err(|error| {
                         format!("Could not request the next native frame: {error}")
                     })?;
@@ -798,13 +809,13 @@ unsafe fn create_cached_input_view(
 unsafe fn present_nv12_sample(
     pipeline: &mut NativeMp4Pipeline,
     sample: &windows::Win32::Media::MediaFoundation::IMFSample,
-) -> Result<(), String> {
+) -> Result<PresentOutcome, String> {
     // DXGI signals only when a back buffer is available. Waiting here avoids
     // waking the render loop just to discover that DWM is still presenting
     // the previous frame. A timeout drops this frame rather than stalling the
     // decoder or preventing shutdown.
     if !pipeline.frame_latency.wait()? {
-        return Ok(());
+        return Ok(PresentOutcome::DroppedFrameLatency);
     }
     let buffer = sample
         .GetBufferByIndex(0)
@@ -884,12 +895,15 @@ unsafe fn present_nv12_sample(
     // composition. If DWM has not released a back buffer yet, drop this frame
     // and decode the next one; no pixels are copied to the CPU.
     let present_status = pipeline.swap_chain.Present(0, DXGI_PRESENT_DO_NOT_WAIT);
-    if present_status.is_err() && present_status != DXGI_ERROR_WAS_STILL_DRAWING {
+    if present_status == DXGI_ERROR_WAS_STILL_DRAWING {
+        return Ok(PresentOutcome::DroppedCompositorBusy);
+    }
+    if present_status.is_err() {
         return Err(format!(
             "Could not present the GPU-converted frame: {present_status}"
         ));
     }
-    Ok(())
+    Ok(PresentOutcome::Presented)
 }
 
 fn ensure_media_foundation_started() -> bool {
@@ -1126,7 +1140,7 @@ impl ExternalNv12Presenter {
     pub(crate) unsafe fn present(
         &mut self,
         sample: &windows::Win32::Media::MediaFoundation::IMFSample,
-    ) -> Result<(), String> {
+    ) -> Result<PresentOutcome, String> {
         present_nv12_sample(&mut self.pipeline, sample)
     }
 }

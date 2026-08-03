@@ -4,6 +4,7 @@
 //! decoded NV12 surfaces remain in GPU memory through the VideoProcessor blit.
 
 use crate::media_event_queue::{EventOrigin, MediaEventSubscription, QueuedMediaEvent};
+use crate::mf_d3d11::PresentOutcome;
 use crate::playback_clock::PlaybackClock;
 
 use std::{
@@ -493,7 +494,15 @@ pub fn decode_and_present_first_direct_mp4_sample(path: &str, host: HWND) -> Res
     let mut presenter = unsafe { session.create_presenter(host, true)? };
     let sample = read_first_direct_video_sample(path, Duration::from_secs(3))?;
     let nv12 = unsafe { process_sample_to_nv12(&session, &sample)? };
-    unsafe { presenter.present(&nv12) }
+    match unsafe { presenter.present(&nv12)? } {
+        PresentOutcome::Presented => Ok(()),
+        PresentOutcome::DroppedFrameLatency => {
+            Err("The first GPU frame was dropped while waiting for the desktop swap chain.".into())
+        }
+        PresentOutcome::DroppedCompositorBusy => {
+            Err("The first GPU frame was dropped because the desktop compositor was busy.".into())
+        }
+    }
 }
 
 unsafe fn process_sample_to_nv12(
@@ -534,6 +543,73 @@ unsafe fn process_sample_to_nv12(
 pub struct NativeSmokeStats {
     pub input_samples: u32,
     pub output_frames: u32,
+    pub dropped_frame_latency: u32,
+    pub dropped_compositor_busy: u32,
+}
+
+const NO_SUCCESSFUL_PRESENT: u64 = u64::MAX;
+
+struct RendererFrameStatistics {
+    decoded: AtomicU64,
+    presented: AtomicU64,
+    dropped_frame_latency: AtomicU64,
+    dropped_compositor_busy: AtomicU64,
+    dropped_late: AtomicU64,
+    last_presented_at_ms: AtomicU64,
+}
+
+impl Default for RendererFrameStatistics {
+    fn default() -> Self {
+        Self {
+            decoded: AtomicU64::new(0),
+            presented: AtomicU64::new(0),
+            dropped_frame_latency: AtomicU64::new(0),
+            dropped_compositor_busy: AtomicU64::new(0),
+            dropped_late: AtomicU64::new(0),
+            last_presented_at_ms: AtomicU64::new(NO_SUCCESSFUL_PRESENT),
+        }
+    }
+}
+
+impl RendererFrameStatistics {
+    fn record_decoded(&self) {
+        self.decoded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns true only for the first frame that reached the desktop swap
+    /// chain. Normal frame drops remain observable but never complete startup.
+    fn record_presentation(&self, outcome: PresentOutcome, elapsed_ms: u64) -> bool {
+        match outcome {
+            PresentOutcome::Presented => {
+                self.last_presented_at_ms
+                    .store(elapsed_ms, Ordering::Release);
+                self.presented.fetch_add(1, Ordering::AcqRel) == 0
+            }
+            PresentOutcome::DroppedFrameLatency => {
+                self.dropped_frame_latency.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            PresentOutcome::DroppedCompositorBusy => {
+                self.dropped_compositor_busy.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    fn record_late_drop(&self) {
+        self.dropped_late.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn dropped_total(&self) -> u64 {
+        self.dropped_frame_latency
+            .load(Ordering::Acquire)
+            .saturating_add(self.dropped_compositor_busy.load(Ordering::Acquire))
+            .saturating_add(self.dropped_late.load(Ordering::Acquire))
+    }
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 /// Production MP4 renderer backed by the direct Media Source -> DXVA MFT ->
@@ -545,9 +621,10 @@ pub struct DirectMp4Renderer {
     paused: Arc<AtomicBool>,
     activated: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
-    frames_presented: Arc<AtomicU64>,
+    frame_statistics: Arc<RendererFrameStatistics>,
     events_received: Arc<AtomicU64>,
     finished: Arc<AtomicBool>,
+    started_at: Instant,
     worker: JoinHandle<()>,
 }
 
@@ -562,7 +639,7 @@ impl DirectMp4Renderer {
         let paused = Arc::new(AtomicBool::new(false));
         let activated = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
-        let frames_presented = Arc::new(AtomicU64::new(0));
+        let frame_statistics = Arc::new(RendererFrameStatistics::default());
         let events_received = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -572,10 +649,12 @@ impl DirectMp4Renderer {
         let worker_paused = Arc::clone(&paused);
         let worker_activated = Arc::clone(&activated);
         let worker_failed = Arc::clone(&failed);
-        let worker_frames = Arc::clone(&frames_presented);
+        let worker_frame_statistics = Arc::clone(&frame_statistics);
         let worker_events = Arc::clone(&events_received);
         let worker_finished = Arc::clone(&finished);
         let worker_clock = Arc::clone(&playback_clock);
+        let started_at = Instant::now();
+        let worker_started_at = started_at;
         let worker = thread::spawn(move || unsafe {
             let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
             let result = if initialized {
@@ -585,11 +664,12 @@ impl DirectMp4Renderer {
                     &worker_stop,
                     &worker_paused,
                     &worker_activated,
-                    &worker_frames,
+                    &worker_frame_statistics,
                     &worker_events,
                     &ready_tx,
                     &worker_clock,
                     stretch_to_fill,
+                    worker_started_at,
                 )
             } else {
                 Err("Could not initialize the native renderer COM apartment.".into())
@@ -612,9 +692,10 @@ impl DirectMp4Renderer {
                 paused,
                 activated,
                 failed,
-                frames_presented,
+                frame_statistics,
                 events_received,
                 finished,
+                started_at,
                 worker,
             }),
             Ok(Err(error)) => {
@@ -662,7 +743,42 @@ impl DirectMp4Renderer {
     }
 
     pub fn frames_presented(&self) -> u64 {
-        self.frames_presented.load(Ordering::Acquire)
+        self.frame_statistics.presented.load(Ordering::Acquire)
+    }
+
+    pub fn frames_decoded(&self) -> u64 {
+        self.frame_statistics.decoded.load(Ordering::Acquire)
+    }
+
+    pub fn frames_dropped(&self) -> u64 {
+        self.frame_statistics.dropped_total()
+    }
+
+    pub fn frames_dropped_frame_latency(&self) -> u64 {
+        self.frame_statistics
+            .dropped_frame_latency
+            .load(Ordering::Acquire)
+    }
+
+    pub fn frames_dropped_compositor_busy(&self) -> u64 {
+        self.frame_statistics
+            .dropped_compositor_busy
+            .load(Ordering::Acquire)
+    }
+
+    pub fn frames_dropped_late(&self) -> u64 {
+        self.frame_statistics.dropped_late.load(Ordering::Acquire)
+    }
+
+    pub fn last_present_age_ms(&self) -> u64 {
+        let presented_at = self
+            .frame_statistics
+            .last_presented_at_ms
+            .load(Ordering::Acquire);
+        if presented_at == NO_SUCCESSFUL_PRESENT {
+            return NO_SUCCESSFUL_PRESENT;
+        }
+        elapsed_millis(self.started_at).saturating_sub(presented_at)
     }
 
     /// Counts asynchronous source, stream, and hardware-MFT callbacks.
@@ -690,11 +806,12 @@ unsafe fn run_direct_playback(
     stop: &Arc<AtomicBool>,
     paused: &AtomicBool,
     activated: &AtomicBool,
-    frames_presented: &AtomicU64,
+    frame_statistics: &RendererFrameStatistics,
     events_received: &Arc<AtomicU64>,
     ready: &mpsc::SyncSender<Result<(), String>>,
     playback_clock: &PlaybackClock,
     stretch_to_fill: bool,
+    started_at: Instant,
 ) -> Result<(), String> {
     // These are the expensive objects. Keep them alive for the entire
     // wallpaper session instead of rebuilding the D3D11/DXVA pipeline at EOF.
@@ -726,7 +843,7 @@ unsafe fn run_direct_playback(
             stop,
             paused,
             activated,
-            frames_presented,
+            frame_statistics,
             ready,
             playback_clock,
             timeline_offset_100ns,
@@ -734,6 +851,7 @@ unsafe fn run_direct_playback(
             &event_tx,
             &event_rx,
             events_received,
+            started_at,
         )?;
         if stop.load(Ordering::Acquire) {
             break;
@@ -791,7 +909,7 @@ unsafe fn run_direct_playback_cycle(
     stop: &Arc<AtomicBool>,
     paused: &AtomicBool,
     activated: &AtomicBool,
-    frames_presented: &AtomicU64,
+    frame_statistics: &RendererFrameStatistics,
     ready: &mpsc::SyncSender<Result<(), String>>,
     playback_clock: &PlaybackClock,
     timeline_offset_100ns: u64,
@@ -799,6 +917,7 @@ unsafe fn run_direct_playback_cycle(
     event_tx: &mpsc::Sender<QueuedMediaEvent>,
     event_rx: &mpsc::Receiver<QueuedMediaEvent>,
     events_received: &Arc<AtomicU64>,
+    started_at: Instant,
 ) -> Result<PlaybackCycleResult, String> {
     let source = &prepared_source.source;
     let descriptor = &prepared_source.descriptor;
@@ -914,6 +1033,7 @@ unsafe fn run_direct_playback_cycle(
                 while decoder_output_ready && decoded.len() < 3 {
                     match try_process_output(session)? {
                         Some(frame) => {
+                            frame_statistics.record_decoded();
                             decoded.push_back(frame);
                             last_progress = Instant::now();
                         }
@@ -941,6 +1061,7 @@ unsafe fn run_direct_playback_cycle(
                     while decoder_output_ready && decoded.len() < 3 {
                         match try_process_output(session)? {
                             Some(frame) => {
+                                frame_statistics.record_decoded();
                                 decoded.push_back(frame);
                                 last_progress = Instant::now();
                             }
@@ -980,22 +1101,26 @@ unsafe fn run_direct_playback_cycle(
                     activated,
                     playback_clock,
                     &mut presentation_clock,
-                    frames_presented.load(Ordering::Acquire) == 0,
+                    frame_statistics.presented.load(Ordering::Acquire) == 0,
                 );
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
                 if !should_present {
+                    frame_statistics.record_late_drop();
                     last_progress = Instant::now();
                     continue;
                 }
-                presenter.present(&frame)?;
-                let previous = frames_presented.fetch_add(1, Ordering::AcqRel);
-                if previous == 0 {
+                let outcome = presenter.present(&frame)?;
+                let first_presented =
+                    frame_statistics.record_presentation(outcome, elapsed_millis(started_at));
+                if first_presented {
                     let _ = ready.try_send(Ok(()));
                 }
                 last_progress = Instant::now();
-                last_presented = last_progress;
+                if outcome == PresentOutcome::Presented {
+                    last_presented = last_progress;
+                }
             }
 
             if let Some(active_stream) = stream.as_ref() {
@@ -1038,7 +1163,7 @@ unsafe fn run_direct_playback_cycle(
             if last_progress.elapsed() >= Duration::from_secs(8) {
                 return Err("Direct native renderer stalled while waiting for MP4 frames.".into());
             }
-            if frames_presented.load(Ordering::Acquire) > 0
+            if frame_statistics.presented.load(Ordering::Acquire) > 0
                 && activated.load(Ordering::Acquire)
                 && !paused.load(Ordering::Acquire)
                 && last_presented.elapsed() >= Duration::from_secs(8)
@@ -1230,9 +1355,20 @@ pub fn run_native_mp4_smoke_test(
             }
             while let Some(frame) = queue.pop_front() {
                 if let Some(presenter) = presenter.as_mut() {
-                    presenter.present(&frame)?;
+                    match presenter.present(&frame)? {
+                        PresentOutcome::Presented => stats.output_frames += 1,
+                        PresentOutcome::DroppedFrameLatency => {
+                            stats.dropped_frame_latency += 1;
+                        }
+                        PresentOutcome::DroppedCompositorBusy => {
+                            stats.dropped_compositor_busy += 1;
+                        }
+                    }
+                } else {
+                    // Decode-only smoke mode validates MFT output without a
+                    // desktop swap chain, so decoded output is its success unit.
+                    stats.output_frames += 1;
                 }
-                stats.output_frames += 1;
             }
             if let Some(active_stream) = stream.as_ref() {
                 match active_stream.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
@@ -1270,9 +1406,18 @@ pub fn run_native_mp4_smoke_test(
                 if session.events.is_none() {
                     while let Some(frame) = queue.pop_front() {
                         if let Some(presenter) = presenter.as_mut() {
-                            presenter.present(&frame)?;
+                            match presenter.present(&frame)? {
+                                PresentOutcome::Presented => stats.output_frames += 1,
+                                PresentOutcome::DroppedFrameLatency => {
+                                    stats.dropped_frame_latency += 1;
+                                }
+                                PresentOutcome::DroppedCompositorBusy => {
+                                    stats.dropped_compositor_busy += 1;
+                                }
+                            }
+                        } else {
+                            stats.output_frames += 1;
                         }
-                        stats.output_frames += 1;
                     }
                 }
             } else {
@@ -1294,8 +1439,10 @@ pub fn run_native_mp4_smoke_test(
         let _ = source.Shutdown();
         if stats.output_frames == 0 {
             return Err(format!(
-                "Native smoke test decoded no frames after {} input samples.",
-                stats.input_samples
+                "Native smoke test produced no visible frames after {} input samples (frame-latency drops: {}, compositor-busy drops: {}).",
+                stats.input_samples,
+                stats.dropped_frame_latency,
+                stats.dropped_compositor_busy
             ));
         }
         Ok(stats)
@@ -1596,4 +1743,49 @@ fn decoder_enum_flags() -> MFT_ENUM_FLAG {
     // Microsoft's H.264/HEVC decoder is commonly registered as a regular MFT
     // and activates DXVA only after receiving an IMFDXGIDeviceManager.
     MFT_ENUM_FLAG(MFT_ENUM_FLAG_ALL.0 | MFT_ENUM_FLAG_SORTANDFILTER.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PresentOutcome, RendererFrameStatistics, NO_SUCCESSFUL_PRESENT};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn dropped_frames_never_complete_the_first_frame_handshake() {
+        let statistics = RendererFrameStatistics::default();
+
+        assert!(!statistics.record_presentation(PresentOutcome::DroppedFrameLatency, 10));
+        assert!(!statistics.record_presentation(PresentOutcome::DroppedCompositorBusy, 20));
+        assert_eq!(statistics.presented.load(Ordering::Acquire), 0);
+        assert_eq!(statistics.dropped_total(), 2);
+        assert_eq!(
+            statistics.last_presented_at_ms.load(Ordering::Acquire),
+            NO_SUCCESSFUL_PRESENT
+        );
+    }
+
+    #[test]
+    fn only_the_first_successful_present_completes_startup() {
+        let statistics = RendererFrameStatistics::default();
+
+        assert!(statistics.record_presentation(PresentOutcome::Presented, 25));
+        assert!(!statistics.record_presentation(PresentOutcome::Presented, 50));
+        assert_eq!(statistics.presented.load(Ordering::Acquire), 2);
+        assert_eq!(statistics.dropped_total(), 0);
+        assert_eq!(statistics.last_presented_at_ms.load(Ordering::Acquire), 50);
+    }
+
+    #[test]
+    fn decoded_and_late_dropped_frames_are_counted_independently() {
+        let statistics = RendererFrameStatistics::default();
+
+        statistics.record_decoded();
+        statistics.record_decoded();
+        statistics.record_late_drop();
+
+        assert_eq!(statistics.decoded.load(Ordering::Acquire), 2);
+        assert_eq!(statistics.presented.load(Ordering::Acquire), 0);
+        assert_eq!(statistics.dropped_late.load(Ordering::Acquire), 1);
+        assert_eq!(statistics.dropped_total(), 1);
+    }
 }

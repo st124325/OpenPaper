@@ -759,8 +759,11 @@ pub extern "C" fn run_native_mp4_smoke_test(file_path: *const c_char) -> u32 {
     ) {
         Ok(stats) => {
             set_last_error(&format!(
-                "Native smoke test passed: {} input samples, {} presented GPU frames.",
-                stats.input_samples, stats.output_frames
+                "Native smoke test passed: {} input samples, {} presented GPU frames, {} frame-latency drops, {} compositor-busy drops.",
+                stats.input_samples,
+                stats.output_frames,
+                stats.dropped_frame_latency,
+                stats.dropped_compositor_busy
             ));
             stats.output_frames
         }
@@ -800,6 +803,95 @@ pub extern "C" fn get_native_renderer_frame_count() -> u64 {
                 .map(|renderer| renderer.frames_presented())
         })
         .unwrap_or(0)
+}
+
+/// Number of GPU NV12 frames produced by the hardware decoder. This can be
+/// greater than the visible-frame count when scheduling or DWM drops a frame.
+#[no_mangle]
+pub extern "C" fn get_native_renderer_decoded_frame_count() -> u64 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.frames_decoded())
+        })
+        .unwrap_or(0)
+}
+
+/// Total number of normal, non-fatal presentation drops.
+#[no_mangle]
+pub extern "C" fn get_native_renderer_dropped_frame_count() -> u64 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.frames_dropped())
+        })
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn get_native_renderer_frame_latency_drop_count() -> u64 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.frames_dropped_frame_latency())
+        })
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn get_native_renderer_compositor_busy_drop_count() -> u64 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.frames_dropped_compositor_busy())
+        })
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn get_native_renderer_late_drop_count() -> u64 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.frames_dropped_late())
+        })
+        .unwrap_or(0)
+}
+
+/// Milliseconds since the last successful desktop Present. `u64::MAX` means
+/// that this renderer has not shown a frame yet or native playback is inactive.
+#[no_mangle]
+pub extern "C" fn get_native_renderer_last_present_age_ms() -> u64 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_renderer
+                .as_ref()
+                .map(|renderer| renderer.last_present_age_ms())
+        })
+        .unwrap_or(u64::MAX)
 }
 
 /// Counts callbacks delivered by Media Foundation. A zero value after the

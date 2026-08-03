@@ -44,6 +44,27 @@ internal static partial class WallpaperEngineInterop
     [return: MarshalAs(UnmanagedType.I1)]
     internal static partial bool SetStretchToFill([MarshalAs(UnmanagedType.I1)] bool enabled);
 
+    [LibraryImport(LibraryName, EntryPoint = "get_native_renderer_frame_count")]
+    internal static partial ulong GetNativeRendererPresentedFrameCount();
+
+    [LibraryImport(LibraryName, EntryPoint = "get_native_renderer_decoded_frame_count")]
+    internal static partial ulong GetNativeRendererDecodedFrameCount();
+
+    [LibraryImport(LibraryName, EntryPoint = "get_native_renderer_dropped_frame_count")]
+    internal static partial ulong GetNativeRendererDroppedFrameCount();
+
+    [LibraryImport(LibraryName, EntryPoint = "get_native_renderer_frame_latency_drop_count")]
+    internal static partial ulong GetNativeRendererFrameLatencyDropCount();
+
+    [LibraryImport(LibraryName, EntryPoint = "get_native_renderer_compositor_busy_drop_count")]
+    internal static partial ulong GetNativeRendererCompositorBusyDropCount();
+
+    [LibraryImport(LibraryName, EntryPoint = "get_native_renderer_late_drop_count")]
+    internal static partial ulong GetNativeRendererLateDropCount();
+
+    [LibraryImport(LibraryName, EntryPoint = "get_native_renderer_last_present_age_ms")]
+    internal static partial ulong GetNativeRendererLastPresentAgeMilliseconds();
+
     [LibraryImport(LibraryName, EntryPoint = "get_last_error")]
     private static unsafe partial nuint GetLastError(byte* buffer, nuint capacity);
 
