@@ -26,8 +26,10 @@ public partial class MainWindow : Window
     private int _lastVolume = 70;
     private string? _availableUpdateVersion;
     private WallpaperCard? _previewCard;
+    private WallpaperCard? _applyingCard;
     private string? _previewPath;
     private Border? _previewTarget;
+    private long _applyRequestId;
 
     public MainWindow()
     {
@@ -63,7 +65,11 @@ public partial class MainWindow : Window
         WallpaperEngineInterop.SetMuteWhenOtherAppOpen(_settings.MuteWhenOtherAppOpen);
         WallpaperEngineInterop.SetPerformanceMode(_settings.PerformanceMode);
         WallpaperEngineInterop.SetStretchToFill(_settings.StretchToFill);
-        if (!string.IsNullOrWhiteSpace(_settings.WallpaperPath) && File.Exists(_settings.WallpaperPath)) ApplyWallpaper(_settings.WallpaperPath!, false);
+        if (!string.IsNullOrWhiteSpace(_settings.WallpaperPath) && File.Exists(_settings.WallpaperPath))
+            _ = ApplyWallpaperAsync(
+                _settings.WallpaperPath!,
+                false,
+                _wallpaperCards.FirstOrDefault(card => string.Equals(card.Path, _settings.WallpaperPath, StringComparison.OrdinalIgnoreCase)));
         else SetStatus("Engine ready. Upload a wallpaper to start.", "Движок готов. Загрузите обои, чтобы начать.");
     }
 
@@ -216,15 +222,32 @@ public partial class MainWindow : Window
         SetStatus("Wallpaper uploaded. Click its card to apply it.", "Обои загружены. Нажмите на их карточку, чтобы применить.");
     }
 
-    private void LibraryCardsSelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void LibraryCardsSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_loading || _syncingLibrarySelection || LibraryCards.SelectedItem is not WallpaperCard card) return;
         if (card.IsEmpty)
         {
-            WallpaperEngineInterop.StopEngine();
-            if (!WallpaperEngineInterop.SetBlackDesktop())
+            var requestId = Interlocked.Increment(ref _applyRequestId);
+            SetApplyingCard(card);
+            SetStatus("Applying black background...", "Установка чёрного фона...");
+            (bool Applied, string Error) result;
+            try
             {
-                SetStatus($"Could not set black background: {WallpaperEngineInterop.GetLastErrorMessage()}", "Не удалось установить чёрный фон.");
+                result = await Task.Run(() =>
+                {
+                    var applied = WallpaperEngineInterop.SetBlackDesktop();
+                    return (applied, applied ? string.Empty : WallpaperEngineInterop.GetLastErrorMessage());
+                });
+            }
+            catch (Exception error)
+            {
+                result = (false, error.Message);
+            }
+            if (requestId != Volatile.Read(ref _applyRequestId)) return;
+            SetApplyingCard(null);
+            if (!result.Applied)
+            {
+                SetStatus($"Could not set black background: {result.Error}", $"Не удалось установить чёрный фон: {result.Error}");
                 return;
             }
             _settings = _settings with { WallpaperPath = null };
@@ -232,14 +255,45 @@ public partial class MainWindow : Window
             SetStatus("Black background applied.", "Установлен чёрный фон.");
             return;
         }
-        ApplyWallpaper(card.Path!, true);
+        await ApplyWallpaperAsync(card.Path!, true, card);
     }
-    private void ApplyWallpaper(string path, bool save)
+
+    private async Task ApplyWallpaperAsync(string path, bool save, WallpaperCard? card = null)
     {
-        if (!WallpaperEngineInterop.SetWallpaper(path)) { SetStatus($"Could not apply wallpaper: {WallpaperEngineInterop.GetLastErrorMessage()}", $"Не удалось применить обои: {WallpaperEngineInterop.GetLastErrorMessage()}"); return; }
+        var requestId = Interlocked.Increment(ref _applyRequestId);
+        SetApplyingCard(card);
+        SetStatus("Applying wallpaper...", "Запуск обоев...");
+        (bool Applied, string Error) result;
+        try
+        {
+            result = await Task.Run(() =>
+            {
+                var applied = WallpaperEngineInterop.SetWallpaper(path);
+                return (applied, applied ? string.Empty : WallpaperEngineInterop.GetLastErrorMessage());
+            });
+        }
+        catch (Exception error)
+        {
+            result = (false, error.Message);
+        }
+        if (requestId != Volatile.Read(ref _applyRequestId)) return;
+        SetApplyingCard(null);
+        if (!result.Applied)
+        {
+            SetStatus($"Could not apply wallpaper: {result.Error}", $"Не удалось применить обои: {result.Error}");
+            return;
+        }
         WallpaperEngineInterop.SetVolume((int)VolumeSlider.Value);
         if (save) { _settings = _settings with { WallpaperPath = path }; _settingsStore.Save(_settings); }
         SetStatus("Wallpaper is playing.", "Обои воспроизводятся.");
+    }
+
+    private void SetApplyingCard(WallpaperCard? card)
+    {
+        if (ReferenceEquals(_applyingCard, card)) return;
+        _applyingCard?.SetApplying(false);
+        _applyingCard = card;
+        _applyingCard?.SetApplying(true);
     }
 
     private void CardPreviewEnter(object sender, System.Windows.Input.MouseEventArgs e)
@@ -427,7 +481,7 @@ public partial class MainWindow : Window
         _settingsStore.Save(_settings);
         UpdatePerformancePill();
         if (!string.IsNullOrWhiteSpace(_settings.WallpaperPath) && File.Exists(_settings.WallpaperPath))
-            ApplyWallpaper(_settings.WallpaperPath, false);
+            _ = ApplyWallpaperAsync(_settings.WallpaperPath, false, LibraryCards.SelectedItem as WallpaperCard);
     }
     private void StretchToFillChanged(object sender, RoutedEventArgs e)
     {
@@ -437,7 +491,7 @@ public partial class MainWindow : Window
         _settings = _settings with { StretchToFill = enabled };
         _settingsStore.Save(_settings);
         if (!string.IsNullOrWhiteSpace(_settings.WallpaperPath) && File.Exists(_settings.WallpaperPath))
-            ApplyWallpaper(_settings.WallpaperPath, false);
+            _ = ApplyWallpaperAsync(_settings.WallpaperPath, false, LibraryCards.SelectedItem as WallpaperCard);
     }
     private void AutoStartChanged(object sender, RoutedEventArgs e)
     {
@@ -461,6 +515,7 @@ public partial class MainWindow : Window
     {
         private string _title;
         private Uri? _thumbnailUri;
+        private bool _isApplying;
 
         public WallpaperCard(string? path, string title)
         {
@@ -471,7 +526,7 @@ public partial class MainWindow : Window
 
         public event PropertyChangedEventHandler? PropertyChanged;
         public string? Path { get; }
-        public string Title => _title;
+        public string Title => _isApplying ? $"••• {_title}" : _title;
         public static WallpaperCard Empty(string title) => new(null, title);
         public bool IsEmpty => Path is null;
         public string FileName => Path is null ? "Windows" : System.IO.Path.GetFileName(Path);
@@ -479,6 +534,15 @@ public partial class MainWindow : Window
         public Uri? ThumbnailUri => _thumbnailUri;
         public string PreviewSymbol => Path is null ? "×" : "▶";
         public bool IsVideo => string.Equals(Extension, "MP4", StringComparison.OrdinalIgnoreCase);
+        public bool IsApplying => _isApplying;
+
+        public void SetApplying(bool value)
+        {
+            if (_isApplying == value) return;
+            _isApplying = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsApplying)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Title)));
+        }
 
         public void UpdateTitle(string title)
         {

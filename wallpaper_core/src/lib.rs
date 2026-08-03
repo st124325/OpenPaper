@@ -59,7 +59,64 @@ impl FallbackStatus {
     }
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PlaybackStatus {
+    #[default]
+    Stopped,
+    Starting,
+    RunningNative,
+    RunningHybrid,
+    RunningVlc,
+    Stopping,
+    Failed,
+}
+
+struct PlaybackConfig {
+    generation: u64,
+    host_window: isize,
+    d3d11_media_foundation_available: bool,
+    muted: bool,
+    volume: i32,
+    performance_mode: i32,
+    stretch_to_fill: bool,
+    paused: bool,
+}
+
+#[derive(Default)]
+struct PlaybackResources {
+    player: Option<vlc::VlcPlayer>,
+    native_renderer: Option<direct_mft::DirectMp4Renderer>,
+    native_audio: Option<native_audio::NativeAudioRenderer>,
+}
+
+impl PlaybackResources {
+    fn stop(self) {
+        if let Some(player) = self.player {
+            player.stop();
+        }
+        if let Some(renderer) = self.native_renderer {
+            renderer.stop();
+        }
+        if let Some(audio) = self.native_audio {
+            audio.stop();
+        }
+    }
+}
+
+struct PreparedPlayback {
+    resources: PlaybackResources,
+    native_mp4_diagnostic: String,
+    native_audio_diagnostic: String,
+    native_mp4_failure_code: u32,
+    video_fallback_status: FallbackStatus,
+    audio_fallback_status: FallbackStatus,
+    status: PlaybackStatus,
+}
+
 struct EngineState {
+    generation: u64,
+    playback_status: PlaybackStatus,
     host_window: isize,
     active_media: Option<String>,
     muted: bool,
@@ -84,10 +141,13 @@ struct EngineState {
 }
 
 static ENGINE: OnceLock<Mutex<EngineState>> = OnceLock::new();
+static PLAYBACK_START_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn engine() -> &'static Mutex<EngineState> {
     ENGINE.get_or_init(|| {
         Mutex::new(EngineState {
+            generation: 0,
+            playback_status: PlaybackStatus::Stopped,
             host_window: 0,
             active_media: None,
             muted: false,
@@ -111,6 +171,10 @@ fn engine() -> &'static Mutex<EngineState> {
             monitor: None,
         })
     })
+}
+
+fn playback_start_gate() -> &'static Mutex<()> {
+    PLAYBACK_START_GATE.get_or_init(|| Mutex::new(()))
 }
 
 /// Locates the WorkerW below desktop icons and attaches our child render target.
@@ -260,142 +324,283 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
         return false;
     }
 
-    let mut state = match engine().lock() {
-        Ok(value) => value,
-        Err(_) => return false,
+    start_wallpaper(path)
+}
+
+fn start_wallpaper(path: String) -> bool {
+    let (config, previous) = {
+        let mut state = match engine().lock() {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        if state.playback_status == PlaybackStatus::Stopping {
+            state.last_error = "Engine shutdown is in progress.".into();
+            return false;
+        }
+        state.generation = state.generation.wrapping_add(1);
+        state.playback_status = PlaybackStatus::Starting;
+        state.active_media = Some(path.clone());
+        state.video_fallback_status = FallbackStatus::Idle;
+        state.audio_fallback_status = FallbackStatus::Idle;
+        state.native_mp4_failure_code = 0;
+        state.last_error.clear();
+        let config = PlaybackConfig {
+            generation: state.generation,
+            host_window: state.host_window,
+            d3d11_media_foundation_available: state.d3d11_media_foundation_available,
+            muted: state.muted || state.automatically_muted,
+            volume: state.volume,
+            performance_mode: state.performance_mode,
+            stretch_to_fill: state.stretch_to_fill,
+            paused: state.fullscreen_paused.load(Ordering::Acquire),
+        };
+        let previous = PlaybackResources {
+            player: state.player.take(),
+            native_renderer: state.native_renderer.take(),
+            native_audio: state.native_audio.take(),
+        };
+        (config, previous)
     };
-    state.video_fallback_status = FallbackStatus::Idle;
-    state.audio_fallback_status = FallbackStatus::Idle;
-    state.native_mp4_failure_code = 0;
-    if let Some(player) = state.player.take() {
-        player.stop();
+
+    // Driver, COM and libVLC teardown must never hold the engine state mutex.
+    previous.stop();
+
+    // Only one pipeline may create a swap chain for the shared wallpaper HWND.
+    // Newer requests can supersede a waiter before it performs expensive work.
+    let _start_guard = match playback_start_gate().lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            set_last_error("Playback startup gate failed.");
+            return false;
+        }
+    };
+    if !generation_is_current(config.generation) {
+        return false;
     }
-    if let Some(renderer) = state.native_renderer.take() {
-        renderer.stop();
+
+    let prepared = match prepare_playback(&path, &config) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Ok(mut state) = engine().lock() {
+                if state.generation == config.generation {
+                    state.playback_status = PlaybackStatus::Failed;
+                    state.active_media = None;
+                    state.last_error = error;
+                }
+            }
+            return false;
+        }
+    };
+
+    let mut state = match engine().lock() {
+        Ok(state) => state,
+        Err(_) => {
+            prepared.resources.stop();
+            return false;
+        }
+    };
+    if !is_current_playback_request(state.generation, state.playback_status, config.generation) {
+        drop(state);
+        prepared.resources.stop();
+        return false;
     }
-    if let Some(audio) = state.native_audio.take() {
-        audio.stop();
+    let current_mute = state.muted || state.automatically_muted;
+    let current_volume = state.volume;
+    let current_pause = state.fullscreen_paused.load(Ordering::Acquire);
+    if let Some(player) = prepared.resources.player.as_ref() {
+        unsafe {
+            player.set_muted(current_mute);
+            player.set_volume(current_volume);
+            player.set_paused(current_pause);
+        }
     }
-    let is_mp4 = Path::new(&path)
+    if let Some(renderer) = prepared.resources.native_renderer.as_ref() {
+        renderer.set_paused(current_pause);
+    }
+    if let Some(audio) = prepared.resources.native_audio.as_ref() {
+        audio.set_muted(current_mute);
+        audio.set_volume(current_volume);
+        audio.set_paused(current_pause);
+    }
+    state.player = prepared.resources.player;
+    state.native_renderer = prepared.resources.native_renderer;
+    state.native_audio = prepared.resources.native_audio;
+    state.native_mp4_diagnostic = prepared.native_mp4_diagnostic;
+    state.native_audio_diagnostic = prepared.native_audio_diagnostic;
+    state.native_mp4_failure_code = prepared.native_mp4_failure_code;
+    state.video_fallback_status = prepared.video_fallback_status;
+    state.audio_fallback_status = prepared.audio_fallback_status;
+    state.playback_status = prepared.status;
+    state.last_error.clear();
+    true
+}
+
+fn generation_is_current(generation: u64) -> bool {
+    engine()
+        .lock()
+        .map(|state| {
+            is_current_playback_request(state.generation, state.playback_status, generation)
+        })
+        .unwrap_or(false)
+}
+
+fn is_current_playback_request(
+    current_generation: u64,
+    status: PlaybackStatus,
+    request_generation: u64,
+) -> bool {
+    current_generation == request_generation && status == PlaybackStatus::Starting
+}
+
+fn prepare_playback(path: &str, config: &PlaybackConfig) -> Result<PreparedPlayback, String> {
+    // Deterministic concurrency tests can keep one generation in the startup
+    // phase while a newer request supersedes it. The client never sets this.
+    if let Some(delay_ms) = std::env::var("OPENPAPER_TEST_STARTUP_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        thread::sleep(Duration::from_millis(delay_ms.min(5_000)));
+    }
+    let is_mp4 = Path::new(path)
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("mp4"));
     let playback_clock = Arc::new(playback_clock::PlaybackClock::new());
-    let native_renderer = if is_mp4 && state.d3d11_media_foundation_available {
+    let mut native_mp4_failure_code = 0;
+    let (native_renderer, native_mp4_diagnostic) = if is_mp4
+        && config.d3d11_media_foundation_available
+    {
         match direct_mft::DirectMp4Renderer::start(
-            path.clone(),
-            HWND(state.host_window as _),
+            path.to_owned(),
+            HWND(config.host_window as _),
             Arc::clone(&playback_clock),
-            state.stretch_to_fill,
+            config.stretch_to_fill,
         ) {
-            Ok(renderer) => {
-                state.native_mp4_diagnostic =
-                    "Direct Media Foundation/DXVA renderer is active.".into();
-                Some(renderer)
-            }
+            Ok(renderer) => (
+                Some(renderer),
+                "Direct Media Foundation/DXVA renderer is active.".into(),
+            ),
             Err(error) => {
-                state.native_mp4_failure_code = direct_mft::renderer_failure_code(&error);
-                state.native_mp4_diagnostic = format!(
-                    "Direct renderer preflight failed; libVLC D3D11VA fallback is active: {error}"
-                );
-                None
+                native_mp4_failure_code = direct_mft::renderer_failure_code(&error);
+                (
+                        None,
+                        format!(
+                            "Direct renderer preflight failed; libVLC D3D11VA fallback is active: {error}"
+                        ),
+                    )
             }
         }
     } else {
-        state.native_mp4_diagnostic = if is_mp4 {
-            "D3D11 Media Foundation is unavailable; libVLC D3D11VA fallback is active.".into()
-        } else {
-            "GIF/WEBP playback uses libVLC.".into()
-        };
-        None
+        (
+            None,
+            if is_mp4 {
+                "D3D11 Media Foundation is unavailable; libVLC D3D11VA fallback is active.".into()
+            } else {
+                "GIF/WEBP playback uses libVLC.".into()
+            },
+        )
     };
-    let effective_mute = state.muted || state.automatically_muted;
-    let native_audio = if native_renderer.is_some() {
+
+    let (native_audio, mut native_audio_diagnostic) = if native_renderer.is_some() {
         match native_audio::NativeAudioRenderer::start(
-            path.clone(),
-            effective_mute,
-            state.volume,
+            path.to_owned(),
+            config.muted,
+            config.volume,
             Arc::clone(&playback_clock),
         ) {
-            Ok(audio) => {
-                state.native_audio_diagnostic =
-                    "Native Media Foundation/WASAPI audio is active.".into();
-                Some(audio)
-            }
-            Err(error) => {
-                state.native_audio_diagnostic = format!(
-                    "Native audio preflight failed; libVLC audio fallback is active: {error}"
-                );
-                None
-            }
+            Ok(audio) => (
+                Some(audio),
+                "Native Media Foundation/WASAPI audio is active.".into(),
+            ),
+            Err(error) => (
+                None,
+                format!("Native audio preflight failed; libVLC audio fallback is active: {error}"),
+            ),
         }
     } else {
-        state.native_audio_diagnostic = "libVLC owns audio for this wallpaper.".into();
-        None
+        (None, "libVLC owns audio for this wallpaper.".into())
     };
+
     let show_vlc_video = native_renderer.is_none();
     let needs_vlc = show_vlc_video || native_audio.is_none();
     let player = if needs_vlc {
         match unsafe {
             vlc::VlcPlayer::start(
-                &path,
-                state.host_window as usize,
-                state.performance_mode,
+                path,
+                config.host_window as usize,
+                config.performance_mode,
                 show_vlc_video,
-                state.stretch_to_fill,
+                config.stretch_to_fill,
             )
         } {
             Ok(player) => Some(player),
             Err(error) if native_renderer.is_some() => {
-                state.native_audio_diagnostic = format!(
+                native_audio_diagnostic = format!(
                     "Native audio and libVLC audio fallback both failed; video remains active: {error}"
                 );
                 None
             }
             Err(error) => {
-                if let Some(renderer) = native_renderer {
-                    renderer.stop();
+                PlaybackResources {
+                    player: None,
+                    native_renderer,
+                    native_audio,
                 }
-                if let Some(audio) = native_audio {
-                    audio.stop();
-                }
-                state.last_error = error;
-                return false;
+                .stop();
+                return Err(error);
             }
         }
     } else {
         None
     };
-    state.active_media = Some(path);
+
     if let Some(player) = player.as_ref() {
         unsafe {
-            player.set_muted(effective_mute);
-            player.set_volume(state.volume);
+            player.set_muted(config.muted);
+            player.set_volume(config.volume);
+            player.set_paused(config.paused);
         }
     }
     if let Some(renderer) = native_renderer.as_ref() {
-        renderer.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
+        renderer.set_paused(config.paused);
         renderer.activate();
     }
     if let Some(audio) = native_audio.as_ref() {
-        audio.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
+        audio.set_paused(config.paused);
         audio.activate();
     }
-    state.player = player;
-    state.native_renderer = native_renderer;
-    state.native_audio = native_audio;
-    state.video_fallback_status = if show_vlc_video && state.player.is_some() {
+
+    let video_fallback_status = if show_vlc_video && player.is_some() {
         FallbackStatus::Active
     } else {
         FallbackStatus::Idle
     };
-    state.audio_fallback_status = if state.native_audio.is_none() && state.player.is_some() {
+    let audio_fallback_status = if native_audio.is_none() && player.is_some() {
         FallbackStatus::Active
     } else {
         FallbackStatus::Idle
     };
-    state.last_error.clear();
-    true
+    let status = if native_renderer.is_none() {
+        PlaybackStatus::RunningVlc
+    } else if player.is_some() || native_audio.is_none() {
+        PlaybackStatus::RunningHybrid
+    } else {
+        PlaybackStatus::RunningNative
+    };
+    Ok(PreparedPlayback {
+        resources: PlaybackResources {
+            player,
+            native_renderer,
+            native_audio,
+        },
+        native_mp4_diagnostic,
+        native_audio_diagnostic,
+        native_mp4_failure_code,
+        video_fallback_status,
+        audio_fallback_status,
+        status,
+    })
 }
 
 /// 0=eco, 1=balanced, 2=quality. New mode is applied when playback restarts.
@@ -506,34 +711,42 @@ pub extern "C" fn get_last_error(buffer: *mut c_char, capacity: usize) -> usize 
 /// Stops the renderer, monitor and the child window. Safe to call repeatedly.
 #[no_mangle]
 pub extern "C" fn stop_engine() {
-    let monitor = {
+    let (monitor, resources, host_window) = {
         let mut state = match engine().lock() {
             Ok(value) => value,
             Err(_) => return,
         };
+        state.generation = state.generation.wrapping_add(1);
+        state.playback_status = PlaybackStatus::Stopping;
         state.monitor_stop.store(true, Ordering::Release);
         state.active_media = None;
         state.video_fallback_status = FallbackStatus::Idle;
         state.audio_fallback_status = FallbackStatus::Idle;
         state.native_mp4_failure_code = 0;
         state.last_error.clear();
-        if let Some(player) = state.player.take() {
-            player.stop();
-        }
-        if let Some(renderer) = state.native_renderer.take() {
-            renderer.stop();
-        }
-        if let Some(audio) = state.native_audio.take() {
-            audio.stop();
-        }
-        if state.host_window != 0 {
-            unsafe {
-                let _ = DestroyWindow(HWND(state.host_window as _));
-            }
-            state.host_window = 0;
-        }
-        state.monitor.take()
+        let resources = PlaybackResources {
+            player: state.player.take(),
+            native_renderer: state.native_renderer.take(),
+            native_audio: state.native_audio.take(),
+        };
+        (state.monitor.take(), resources, state.host_window)
     };
+    resources.stop();
+
+    // Wait for an already-running startup to observe the new generation and
+    // dispose its uncommitted pipeline before the shared HWND is destroyed.
+    let _start_guard = playback_start_gate().lock().ok();
+    if host_window != 0 {
+        unsafe {
+            let _ = DestroyWindow(HWND(host_window as _));
+        }
+    }
+    if let Ok(mut state) = engine().lock() {
+        if state.playback_status == PlaybackStatus::Stopping {
+            state.host_window = 0;
+            state.playback_status = PlaybackStatus::Stopped;
+        }
+    }
     if let Some(thread) = monitor {
         let _ = thread.join();
     }
@@ -965,6 +1178,24 @@ pub extern "C" fn get_native_audio_fallback_status() -> u32 {
         .unwrap_or(FallbackStatus::Failed as u32)
 }
 
+/// 0=stopped, 1=starting, 2=native, 3=hybrid, 4=libVLC, 5=stopping, 6=failed.
+#[no_mangle]
+pub extern "C" fn get_engine_playback_status() -> u32 {
+    engine()
+        .lock()
+        .map(|state| state.playback_status as u32)
+        .unwrap_or(PlaybackStatus::Failed as u32)
+}
+
+/// Monotonically changing request generation used to reject stale startups.
+#[no_mangle]
+pub extern "C" fn get_engine_generation() -> u64 {
+    engine()
+        .lock()
+        .map(|state| state.generation)
+        .unwrap_or(u64::MAX)
+}
+
 /// Counts callbacks delivered by Media Foundation. A zero value after the
 /// watchdog interval distinguishes a stalled source reader from a D3D11
 /// presentation failure.
@@ -1097,6 +1328,7 @@ pub extern "C" fn get_native_audio_diagnostic(buffer: *mut c_char, capacity: usi
 /// not unexpectedly alter a user's desktop, while selecting "No wallpaper" does.
 #[no_mangle]
 pub extern "C" fn set_black_desktop() -> bool {
+    clear_playback_preserving_host();
     let color_indexes = [COLOR_DESKTOP.0];
     let black = [COLORREF(0)];
     let color_result = unsafe { SetSysColors(1, color_indexes.as_ptr(), black.as_ptr()).is_ok() };
@@ -1118,6 +1350,34 @@ pub extern "C" fn set_black_desktop() -> bool {
         }
     }
     color_result && wallpaper_result
+}
+
+fn clear_playback_preserving_host() {
+    let (generation, resources) = {
+        let mut state = match engine().lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.generation = state.generation.wrapping_add(1);
+        state.playback_status = PlaybackStatus::Stopping;
+        state.active_media = None;
+        state.video_fallback_status = FallbackStatus::Idle;
+        state.audio_fallback_status = FallbackStatus::Idle;
+        state.native_mp4_failure_code = 0;
+        let resources = PlaybackResources {
+            player: state.player.take(),
+            native_renderer: state.native_renderer.take(),
+            native_audio: state.native_audio.take(),
+        };
+        (state.generation, resources)
+    };
+    resources.stop();
+    let _start_guard = playback_start_gate().lock().ok();
+    if let Ok(mut state) = engine().lock() {
+        if state.generation == generation && state.playback_status == PlaybackStatus::Stopping {
+            state.playback_status = PlaybackStatus::Stopped;
+        }
+    }
 }
 
 fn set_last_error(message: &str) {
@@ -1245,6 +1505,7 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
     let Some(path) = state.active_media.clone() else {
         state.video_fallback_status = FallbackStatus::Failed;
         state.audio_fallback_status = FallbackStatus::Failed;
+        state.playback_status = PlaybackStatus::Failed;
         state.last_error =
             "Native renderer stopped and no wallpaper path is available for fallback.".into();
         return;
@@ -1267,6 +1528,7 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
             state.player = Some(player);
             state.video_fallback_status = FallbackStatus::Active;
             state.audio_fallback_status = FallbackStatus::Active;
+            state.playback_status = PlaybackStatus::RunningVlc;
             state.native_mp4_diagnostic = format!(
                 "Native renderer failed during playback; libVLC D3D11VA fallback is active. Cause: {failure}"
             );
@@ -1275,6 +1537,7 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
         Err(error) => {
             state.video_fallback_status = FallbackStatus::Failed;
             state.audio_fallback_status = FallbackStatus::Failed;
+            state.playback_status = PlaybackStatus::Failed;
             state.last_error = format!(
                 "Native renderer failed and libVLC fallback could not start. Cause: {failure}. Fallback error: {error}"
             )
@@ -1301,10 +1564,12 @@ fn fallback_audio_to_vlc_if_native_failed(state: &mut EngineState) {
     }
     if state.player.is_some() {
         state.audio_fallback_status = FallbackStatus::Active;
+        state.playback_status = PlaybackStatus::RunningHybrid;
         return;
     }
     let Some(path) = state.active_media.clone() else {
         state.audio_fallback_status = FallbackStatus::Failed;
+        state.playback_status = PlaybackStatus::RunningHybrid;
         state.last_error =
             "Native audio stopped and no wallpaper path is available for fallback.".into();
         return;
@@ -1326,6 +1591,7 @@ fn fallback_audio_to_vlc_if_native_failed(state: &mut EngineState) {
             }
             state.player = Some(player);
             state.audio_fallback_status = FallbackStatus::Active;
+            state.playback_status = PlaybackStatus::RunningHybrid;
             state.native_audio_diagnostic = format!(
                 "Native audio failed during playback; libVLC audio fallback is active. Cause: {failure}"
             );
@@ -1333,6 +1599,7 @@ fn fallback_audio_to_vlc_if_native_failed(state: &mut EngineState) {
         }
         Err(error) => {
             state.audio_fallback_status = FallbackStatus::Failed;
+            state.playback_status = PlaybackStatus::RunningHybrid;
             state.last_error = format!(
                 "Native audio failed and libVLC audio fallback could not start. Cause: {failure}. Fallback error: {error}"
             )
@@ -1410,7 +1677,7 @@ unsafe extern "system" fn host_window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::FallbackStatus;
+    use super::{is_current_playback_request, FallbackStatus, PlaybackStatus};
 
     #[test]
     fn fallback_can_begin_only_once_until_the_next_wallpaper_resets_it() {
@@ -1428,5 +1695,13 @@ mod tests {
 
         status = FallbackStatus::Idle;
         assert!(status.try_begin());
+    }
+
+    #[test]
+    fn only_the_latest_starting_generation_can_commit_resources() {
+        assert!(is_current_playback_request(8, PlaybackStatus::Starting, 8));
+        assert!(!is_current_playback_request(9, PlaybackStatus::Starting, 8));
+        assert!(!is_current_playback_request(8, PlaybackStatus::Stopping, 8));
+        assert!(!is_current_playback_request(8, PlaybackStatus::Failed, 8));
     }
 }

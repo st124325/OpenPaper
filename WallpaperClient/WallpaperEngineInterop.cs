@@ -74,6 +74,12 @@ internal static partial class WallpaperEngineInterop
     [LibraryImport(LibraryName, EntryPoint = "get_native_audio_fallback_status")]
     internal static partial uint GetNativeAudioFallbackStatus();
 
+    [LibraryImport(LibraryName, EntryPoint = "get_engine_playback_status")]
+    internal static partial uint GetEnginePlaybackStatus();
+
+    [LibraryImport(LibraryName, EntryPoint = "get_engine_generation")]
+    internal static partial ulong GetEngineGeneration();
+
     [LibraryImport(LibraryName, EntryPoint = "get_last_error")]
     private static unsafe partial nuint GetLastError(byte* buffer, nuint capacity);
 

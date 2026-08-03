@@ -1,5 +1,5 @@
 OPENPAPER — ПЛАН БУДУЩИХ ОБНОВЛЕНИЙ
-Текущая версия: 0.0.19
+Текущая версия: 0.0.20
 
 СТРАТЕГИЯ
 
@@ -54,7 +54,7 @@ v0.0.19 — надёжный watchdog и fallback [ВЫПОЛНЕНО]
 
 ЭТАП 2. БЕЗОПАСНОЕ УПРАВЛЕНИЕ ДВИЖКОМ
 
-v0.0.20 — Engine State Machine
+v0.0.20 — Engine State Machine [ВЫПОЛНЕНО]
 
 Состояния:
 - Stopped;
@@ -585,7 +585,7 @@ v1.0.0 — стабильный OpenPaper
 
 1. v0.0.18 — PresentOutcome и точные счётчики.
 2. v0.0.19 — watchdog и безопасный fallback [ВЫПОЛНЕНО].
-3. v0.0.20 — generation-based Engine State Machine и асинхронное переключение.
+3. v0.0.20 — generation-based Engine State Machine и асинхронное переключение [ВЫПОЛНЕНО].
 4. После этого — waitable timer и устранение polling.
 
 Каждая версия выпускается только после прохождения своих критериев готовности.
