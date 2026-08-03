@@ -65,6 +65,15 @@ internal static partial class WallpaperEngineInterop
     [LibraryImport(LibraryName, EntryPoint = "get_native_renderer_last_present_age_ms")]
     internal static partial ulong GetNativeRendererLastPresentAgeMilliseconds();
 
+    [LibraryImport(LibraryName, EntryPoint = "get_native_renderer_failure_code")]
+    internal static partial uint GetNativeRendererFailureCode();
+
+    [LibraryImport(LibraryName, EntryPoint = "get_native_video_fallback_status")]
+    internal static partial uint GetNativeVideoFallbackStatus();
+
+    [LibraryImport(LibraryName, EntryPoint = "get_native_audio_fallback_status")]
+    internal static partial uint GetNativeAudioFallbackStatus();
+
     [LibraryImport(LibraryName, EntryPoint = "get_last_error")]
     private static unsafe partial nuint GetLastError(byte* buffer, nuint capacity);
 

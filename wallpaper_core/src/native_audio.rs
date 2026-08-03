@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -47,6 +47,7 @@ pub struct NativeAudioRenderer {
     muted: Arc<AtomicBool>,
     volume: Arc<AtomicI32>,
     failed: Arc<AtomicBool>,
+    failure_message: Arc<Mutex<String>>,
     frames_written: Arc<AtomicU64>,
     finished: Arc<AtomicBool>,
     worker: JoinHandle<()>,
@@ -65,6 +66,7 @@ impl NativeAudioRenderer {
         let muted_state = Arc::new(AtomicBool::new(muted));
         let volume_state = Arc::new(AtomicI32::new(volume.clamp(0, 100)));
         let failed = Arc::new(AtomicBool::new(false));
+        let failure_message = Arc::new(Mutex::new(String::new()));
         let frames_written = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -75,6 +77,7 @@ impl NativeAudioRenderer {
         let worker_muted = Arc::clone(&muted_state);
         let worker_volume = Arc::clone(&volume_state);
         let worker_failed = Arc::clone(&failed);
+        let worker_failure_message = Arc::clone(&failure_message);
         let worker_frames = Arc::clone(&frames_written);
         let worker_finished = Arc::clone(&finished);
         let worker_clock = Arc::clone(&playback_clock);
@@ -96,6 +99,9 @@ impl NativeAudioRenderer {
                 Err("Could not initialize the native audio COM apartment.".into())
             };
             if let Err(error) = result {
+                if let Ok(mut message) = worker_failure_message.lock() {
+                    error.clone_into(&mut message);
+                }
                 let _ = ready_tx.try_send(Err(error));
                 if !worker_stop.load(Ordering::Acquire) {
                     worker_failed.store(true, Ordering::Release);
@@ -116,6 +122,7 @@ impl NativeAudioRenderer {
                 muted: muted_state,
                 volume: volume_state,
                 failed,
+                failure_message,
                 frames_written,
                 finished,
                 worker,
@@ -157,6 +164,13 @@ impl NativeAudioRenderer {
 
     pub fn frames_written(&self) -> u64 {
         self.frames_written.load(Ordering::Acquire)
+    }
+
+    pub fn failure_diagnostic(&self) -> String {
+        self.failure_message
+            .lock()
+            .map(|message| message.clone())
+            .unwrap_or_else(|_| "Native audio failure state is unavailable.".into())
     }
 
     pub fn stop(self) {
@@ -361,6 +375,12 @@ unsafe fn run_audio_renderer(
     let mut is_paused = false;
     let mut applied_muted = muted.load(Ordering::Acquire);
     let mut applied_volume = volume.load(Ordering::Acquire);
+    // Diagnostic-only fault injection used by the end-to-end fallback test.
+    // The desktop client never sets this environment variable.
+    let diagnostic_failure_after = std::env::var("OPENPAPER_TEST_NATIVE_AUDIO_FAIL_AFTER_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0);
 
     while !stop.load(Ordering::Acquire) {
         let requested_pause = paused.load(Ordering::Acquire);
@@ -425,7 +445,15 @@ unsafe fn run_audio_renderer(
             render
                 .ReleaseBuffer(writable_frames, 0)
                 .map_err(|e| format!("Could not submit a WASAPI render buffer: {e}"))?;
-            frames_written.fetch_add(writable_frames as u64, Ordering::Release);
+            let total_frames = frames_written
+                .fetch_add(writable_frames as u64, Ordering::AcqRel)
+                .saturating_add(writable_frames as u64);
+            if diagnostic_failure_after.is_some_and(|limit| total_frames >= limit) {
+                return Err(
+                    "Diagnostic native audio failure requested after successful WASAPI frames."
+                        .into(),
+                );
+            }
         }
     }
     let _ = client.Stop();

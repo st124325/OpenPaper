@@ -11,8 +11,8 @@ use std::{
     collections::VecDeque,
     mem::ManuallyDrop,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -548,6 +548,118 @@ pub struct NativeSmokeStats {
 }
 
 const NO_SUCCESSFUL_PRESENT: u64 = u64::MAX;
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
+const PLAYBACK_PROGRESS_TIMEOUT: Duration = Duration::from_secs(8);
+const PRESENTATION_PROGRESS_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RendererFailureKind {
+    None = 0,
+    FirstFrameTimeout = 1,
+    MediaSource = 2,
+    Decoder = 3,
+    Presenter = 4,
+    DeviceLost = 5,
+    PlaybackStalled = 6,
+    PresentationStalled = 7,
+    WorkerWindow = 8,
+    Unknown = 255,
+}
+
+impl RendererFailureKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::FirstFrameTimeout => "FirstFrameTimeout",
+            Self::MediaSource => "MediaSource",
+            Self::Decoder => "Decoder",
+            Self::Presenter => "Presenter",
+            Self::DeviceLost => "DeviceLost",
+            Self::PlaybackStalled => "PlaybackStalled",
+            Self::PresentationStalled => "PresentationStalled",
+            Self::WorkerWindow => "WorkerWindow",
+            Self::Unknown => "Unknown",
+        }
+    }
+
+    fn classify(message: &str) -> Self {
+        let message = message.to_ascii_lowercase();
+        if message.contains("firstframetimeout") || message.contains("first gpu frame within") {
+            Self::FirstFrameTimeout
+        } else if message.contains("0x887a0005")
+            || message.contains("0x887a0006")
+            || message.contains("0x887a0007")
+            || message.contains("device removed")
+            || message.contains("device reset")
+            || message.contains("device hung")
+        {
+            Self::DeviceLost
+        } else if message.contains("stopped presenting gpu frames") {
+            Self::PresentationStalled
+        } else if message.contains("stalled while waiting for mp4 frames") {
+            Self::PlaybackStalled
+        } else if message.contains("workerw") || message.contains("host window") {
+            Self::WorkerWindow
+        } else if message.contains("present")
+            || message.contains("swap chain")
+            || message.contains("swap-chain")
+            || message.contains("videoprocessor")
+            || message.contains("video processor")
+        {
+            Self::Presenter
+        } else if message.contains("decoder") || message.contains("mft") || message.contains("nv12")
+        {
+            Self::Decoder
+        } else if message.contains("media source")
+            || message.contains("mp4 source")
+            || message.contains("media stream")
+            || message.contains("demux")
+        {
+            Self::MediaSource
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+pub(crate) fn renderer_failure_code(message: &str) -> u32 {
+    RendererFailureKind::classify(message) as u32
+}
+
+fn playback_watchdog_failure(
+    has_presented_frame: bool,
+    activated: bool,
+    paused: bool,
+    time_since_progress: Duration,
+    time_since_present: Duration,
+) -> Option<RendererFailureKind> {
+    if time_since_progress >= PLAYBACK_PROGRESS_TIMEOUT {
+        return Some(RendererFailureKind::PlaybackStalled);
+    }
+    if has_presented_frame
+        && activated
+        && !paused
+        && time_since_present >= PRESENTATION_PROGRESS_TIMEOUT
+    {
+        return Some(RendererFailureKind::PresentationStalled);
+    }
+    None
+}
+
+fn store_renderer_failure(
+    kind: RendererFailureKind,
+    message: &str,
+    failure_kind: &AtomicU32,
+    failure_message: &Mutex<String>,
+) -> String {
+    let diagnostic = format!("[{}] {message}", kind.label());
+    if let Ok(mut slot) = failure_message.lock() {
+        diagnostic.clone_into(&mut slot);
+    }
+    failure_kind.store(kind as u32, Ordering::Release);
+    diagnostic
+}
 
 struct RendererFrameStatistics {
     decoded: AtomicU64,
@@ -622,6 +734,8 @@ pub struct DirectMp4Renderer {
     activated: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     frame_statistics: Arc<RendererFrameStatistics>,
+    failure_kind: Arc<AtomicU32>,
+    failure_message: Arc<Mutex<String>>,
     events_received: Arc<AtomicU64>,
     finished: Arc<AtomicBool>,
     started_at: Instant,
@@ -640,6 +754,8 @@ impl DirectMp4Renderer {
         let activated = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
         let frame_statistics = Arc::new(RendererFrameStatistics::default());
+        let failure_kind = Arc::new(AtomicU32::new(RendererFailureKind::None as u32));
+        let failure_message = Arc::new(Mutex::new(String::new()));
         let events_received = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -650,6 +766,8 @@ impl DirectMp4Renderer {
         let worker_activated = Arc::clone(&activated);
         let worker_failed = Arc::clone(&failed);
         let worker_frame_statistics = Arc::clone(&frame_statistics);
+        let worker_failure_kind = Arc::clone(&failure_kind);
+        let worker_failure_message = Arc::clone(&failure_message);
         let worker_events = Arc::clone(&events_received);
         let worker_finished = Arc::clone(&finished);
         let worker_clock = Arc::clone(&playback_clock);
@@ -675,7 +793,13 @@ impl DirectMp4Renderer {
                 Err("Could not initialize the native renderer COM apartment.".into())
             };
             if let Err(error) = result {
-                let _ = ready_tx.try_send(Err(error));
+                let diagnostic = store_renderer_failure(
+                    RendererFailureKind::classify(&error),
+                    &error,
+                    &worker_failure_kind,
+                    &worker_failure_message,
+                );
+                let _ = ready_tx.try_send(Err(diagnostic));
                 if !worker_stop.load(Ordering::Acquire) {
                     worker_failed.store(true, Ordering::Release);
                 }
@@ -686,13 +810,15 @@ impl DirectMp4Renderer {
             }
         });
 
-        match ready_rx.recv_timeout(Duration::from_secs(8)) {
+        match ready_rx.recv_timeout(FIRST_FRAME_TIMEOUT) {
             Ok(Ok(())) => Ok(Self {
                 stop,
                 paused,
                 activated,
                 failed,
                 frame_statistics,
+                failure_kind,
+                failure_message,
                 events_received,
                 finished,
                 started_at,
@@ -710,7 +836,11 @@ impl DirectMp4Renderer {
                 if finished.load(Ordering::Acquire) {
                     let _ = worker.join();
                 }
-                Err("Direct native renderer did not present its first GPU frame in time.".into())
+                Err(format!(
+                    "[{}] Direct native renderer did not present its first GPU frame within {} seconds.",
+                    RendererFailureKind::FirstFrameTimeout.label(),
+                    FIRST_FRAME_TIMEOUT.as_secs()
+                ))
             }
         }
     }
@@ -779,6 +909,17 @@ impl DirectMp4Renderer {
             return NO_SUCCESSFUL_PRESENT;
         }
         elapsed_millis(self.started_at).saturating_sub(presented_at)
+    }
+
+    pub fn failure_kind_code(&self) -> u32 {
+        self.failure_kind.load(Ordering::Acquire)
+    }
+
+    pub fn failure_diagnostic(&self) -> String {
+        self.failure_message
+            .lock()
+            .map(|message| message.clone())
+            .unwrap_or_else(|_| "[Unknown] Native renderer failure state is unavailable.".into())
     }
 
     /// Counts asynchronous source, stream, and hardware-MFT callbacks.
@@ -953,6 +1094,12 @@ unsafe fn run_direct_playback_cycle(
         let mut last_presented = Instant::now();
         let mut presentation_clock = PresentationClock::new(timeline_offset_100ns);
         let mut queued_events = VecDeque::<QueuedMediaEvent>::with_capacity(16);
+        // End-to-end fallback tests can force a late renderer failure without
+        // modifying normal playback. The desktop client never sets this.
+        let diagnostic_failure_after = std::env::var("OPENPAPER_TEST_NATIVE_FAIL_AFTER_PRESENTS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0);
 
         while !stop.load(Ordering::Acquire) {
             while let Ok(event) = event_rx.try_recv() {
@@ -1120,6 +1267,14 @@ unsafe fn run_direct_playback_cycle(
                 last_progress = Instant::now();
                 if outcome == PresentOutcome::Presented {
                     last_presented = last_progress;
+                    if diagnostic_failure_after.is_some_and(|limit| {
+                        frame_statistics.presented.load(Ordering::Acquire) >= limit
+                    }) {
+                        return Err(
+                            "Diagnostic presenter failure requested after successful GPU frames."
+                                .into(),
+                        );
+                    }
                 }
             }
 
@@ -1160,15 +1315,22 @@ unsafe fn run_direct_playback_cycle(
                     next_source,
                 });
             }
-            if last_progress.elapsed() >= Duration::from_secs(8) {
-                return Err("Direct native renderer stalled while waiting for MP4 frames.".into());
-            }
-            if frame_statistics.presented.load(Ordering::Acquire) > 0
-                && activated.load(Ordering::Acquire)
-                && !paused.load(Ordering::Acquire)
-                && last_presented.elapsed() >= Duration::from_secs(8)
-            {
-                return Err("Direct native renderer stopped presenting GPU frames.".into());
+            if let Some(failure) = playback_watchdog_failure(
+                frame_statistics.presented.load(Ordering::Acquire) > 0,
+                activated.load(Ordering::Acquire),
+                paused.load(Ordering::Acquire),
+                last_progress.elapsed(),
+                last_presented.elapsed(),
+            ) {
+                return Err(match failure {
+                    RendererFailureKind::PlaybackStalled => {
+                        "Direct native renderer stalled while waiting for MP4 frames.".into()
+                    }
+                    RendererFailureKind::PresentationStalled => {
+                        "Direct native renderer stopped presenting GPU frames.".into()
+                    }
+                    _ => unreachable!("playback watchdog returns only stall failures"),
+                });
             }
             // No busy polling: callbacks wake this thread when the source,
             // stream, or asynchronous MFT has actual work. The bounded wait
@@ -1747,8 +1909,12 @@ fn decoder_enum_flags() -> MFT_ENUM_FLAG {
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentOutcome, RendererFrameStatistics, NO_SUCCESSFUL_PRESENT};
+    use super::{
+        playback_watchdog_failure, PresentOutcome, RendererFailureKind, RendererFrameStatistics,
+        NO_SUCCESSFUL_PRESENT, PLAYBACK_PROGRESS_TIMEOUT, PRESENTATION_PROGRESS_TIMEOUT,
+    };
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     #[test]
     fn dropped_frames_never_complete_the_first_frame_handshake() {
@@ -1787,5 +1953,62 @@ mod tests {
         assert_eq!(statistics.presented.load(Ordering::Acquire), 0);
         assert_eq!(statistics.dropped_late.load(Ordering::Acquire), 1);
         assert_eq!(statistics.dropped_total(), 1);
+    }
+
+    #[test]
+    fn failure_classification_separates_runtime_subsystems() {
+        assert_eq!(
+            RendererFailureKind::classify("Could not present the GPU-converted frame"),
+            RendererFailureKind::Presenter
+        );
+        assert_eq!(
+            RendererFailureKind::classify("Hardware MFT ProcessOutput failed"),
+            RendererFailureKind::Decoder
+        );
+        assert_eq!(
+            RendererFailureKind::classify("MP4 source start failed"),
+            RendererFailureKind::MediaSource
+        );
+        assert_eq!(
+            RendererFailureKind::classify("DXGI failure 0x887A0005"),
+            RendererFailureKind::DeviceLost
+        );
+        assert_eq!(
+            RendererFailureKind::classify("Direct native renderer stopped presenting GPU frames."),
+            RendererFailureKind::PresentationStalled
+        );
+    }
+
+    #[test]
+    fn watchdog_ignores_paused_or_not_yet_activated_presentation() {
+        let no_progress = Duration::from_millis(1);
+        let stalled_present = PRESENTATION_PROGRESS_TIMEOUT;
+
+        assert_eq!(
+            playback_watchdog_failure(true, false, false, no_progress, stalled_present),
+            None
+        );
+        assert_eq!(
+            playback_watchdog_failure(true, true, true, no_progress, stalled_present),
+            None
+        );
+    }
+
+    #[test]
+    fn watchdog_distinguishes_decode_and_present_stalls() {
+        assert_eq!(
+            playback_watchdog_failure(true, true, false, PLAYBACK_PROGRESS_TIMEOUT, Duration::ZERO,),
+            Some(RendererFailureKind::PlaybackStalled)
+        );
+        assert_eq!(
+            playback_watchdog_failure(
+                true,
+                true,
+                false,
+                Duration::ZERO,
+                PRESENTATION_PROGRESS_TIMEOUT,
+            ),
+            Some(RendererFailureKind::PresentationStalled)
+        );
     }
 }

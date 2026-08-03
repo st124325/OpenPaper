@@ -39,6 +39,26 @@ use windows::{
 const WM_SPAWN_WORKER: u32 = 0x052C;
 const WINDOW_CLASS: PCWSTR = w!("WallpaperCoreHost");
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FallbackStatus {
+    #[default]
+    Idle,
+    InProgress,
+    Active,
+    Failed,
+}
+
+impl FallbackStatus {
+    fn try_begin(&mut self) -> bool {
+        if *self != Self::Idle {
+            return false;
+        }
+        *self = Self::InProgress;
+        true
+    }
+}
+
 struct EngineState {
     host_window: isize,
     active_media: Option<String>,
@@ -50,7 +70,10 @@ struct EngineState {
     stretch_to_fill: bool,
     d3d11_media_foundation_available: bool,
     native_mp4_diagnostic: String,
+    native_mp4_failure_code: u32,
     native_audio_diagnostic: String,
+    video_fallback_status: FallbackStatus,
+    audio_fallback_status: FallbackStatus,
     last_error: String,
     player: Option<vlc::VlcPlayer>,
     native_renderer: Option<direct_mft::DirectMp4Renderer>,
@@ -75,7 +98,10 @@ fn engine() -> &'static Mutex<EngineState> {
             stretch_to_fill: true,
             d3d11_media_foundation_available: false,
             native_mp4_diagnostic: String::new(),
+            native_mp4_failure_code: 0,
             native_audio_diagnostic: String::new(),
+            video_fallback_status: FallbackStatus::Idle,
+            audio_fallback_status: FallbackStatus::Idle,
             last_error: String::new(),
             player: None,
             native_renderer: None,
@@ -238,6 +264,9 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
         Ok(value) => value,
         Err(_) => return false,
     };
+    state.video_fallback_status = FallbackStatus::Idle;
+    state.audio_fallback_status = FallbackStatus::Idle;
+    state.native_mp4_failure_code = 0;
     if let Some(player) = state.player.take() {
         player.stop();
     }
@@ -265,6 +294,7 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
                 Some(renderer)
             }
             Err(error) => {
+                state.native_mp4_failure_code = direct_mft::renderer_failure_code(&error);
                 state.native_mp4_diagnostic = format!(
                     "Direct renderer preflight failed; libVLC D3D11VA fallback is active: {error}"
                 );
@@ -354,6 +384,16 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
     state.player = player;
     state.native_renderer = native_renderer;
     state.native_audio = native_audio;
+    state.video_fallback_status = if show_vlc_video && state.player.is_some() {
+        FallbackStatus::Active
+    } else {
+        FallbackStatus::Idle
+    };
+    state.audio_fallback_status = if state.native_audio.is_none() && state.player.is_some() {
+        FallbackStatus::Active
+    } else {
+        FallbackStatus::Idle
+    };
     state.last_error.clear();
     true
 }
@@ -473,6 +513,9 @@ pub extern "C" fn stop_engine() {
         };
         state.monitor_stop.store(true, Ordering::Release);
         state.active_media = None;
+        state.video_fallback_status = FallbackStatus::Idle;
+        state.audio_fallback_status = FallbackStatus::Idle;
+        state.native_mp4_failure_code = 0;
         state.last_error.clear();
         if let Some(player) = state.player.take() {
             player.stop();
@@ -894,6 +937,34 @@ pub extern "C" fn get_native_renderer_last_present_age_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Stable diagnostic category for the most recent native video failure.
+/// Zero means that the current wallpaper has not encountered a native failure.
+#[no_mangle]
+pub extern "C" fn get_native_renderer_failure_code() -> u32 {
+    engine()
+        .lock()
+        .map(|state| state.native_mp4_failure_code)
+        .unwrap_or(u32::MAX)
+}
+
+/// 0=idle, 1=in progress, 2=active, 3=failed.
+#[no_mangle]
+pub extern "C" fn get_native_video_fallback_status() -> u32 {
+    engine()
+        .lock()
+        .map(|state| state.video_fallback_status as u32)
+        .unwrap_or(FallbackStatus::Failed as u32)
+}
+
+/// 0=idle, 1=in progress, 2=active, 3=failed.
+#[no_mangle]
+pub extern "C" fn get_native_audio_fallback_status() -> u32 {
+    engine()
+        .lock()
+        .map(|state| state.audio_fallback_status as u32)
+        .unwrap_or(FallbackStatus::Failed as u32)
+}
+
 /// Counts callbacks delivered by Media Foundation. A zero value after the
 /// watchdog interval distinguishes a stalled source reader from a D3D11
 /// presentation failure.
@@ -1141,13 +1212,27 @@ fn fullscreen_monitor(core: &'static Mutex<EngineState>) {
 /// successful start, restore libVLC's proven D3D11VA visual output instead of
 /// leaving an audio-only wallpaper running.
 fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
-    let native_failed = state
+    let failure = state
         .native_renderer
         .as_ref()
-        .is_some_and(|renderer| renderer.has_failed());
-    if !native_failed {
+        .filter(|renderer| renderer.has_failed())
+        .map(|renderer| {
+            let diagnostic = renderer.failure_diagnostic();
+            let code = renderer.failure_kind_code();
+            let diagnostic = if diagnostic.is_empty() {
+                format!("[FailureCode={code}] Native renderer stopped without a diagnostic.")
+            } else {
+                diagnostic
+            };
+            (code, diagnostic)
+        });
+    let Some((failure_code, failure)) = failure else {
+        return;
+    };
+    if !state.video_fallback_status.try_begin() {
         return;
     }
+    state.native_mp4_failure_code = failure_code;
     if let Some(renderer) = state.native_renderer.take() {
         renderer.stop();
     }
@@ -1157,14 +1242,16 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
     if let Some(player) = state.player.take() {
         player.stop();
     }
-    let Some(path) = state.active_media.as_deref() else {
+    let Some(path) = state.active_media.clone() else {
+        state.video_fallback_status = FallbackStatus::Failed;
+        state.audio_fallback_status = FallbackStatus::Failed;
         state.last_error =
             "Native renderer stopped and no wallpaper path is available for fallback.".into();
         return;
     };
     match unsafe {
         vlc::VlcPlayer::start(
-            path,
+            &path,
             state.host_window as usize,
             state.performance_mode,
             true,
@@ -1178,13 +1265,19 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
                 player.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
             }
             state.player = Some(player);
-            state.native_mp4_diagnostic =
-                "Native renderer failed during playback; libVLC D3D11VA fallback is active.".into();
+            state.video_fallback_status = FallbackStatus::Active;
+            state.audio_fallback_status = FallbackStatus::Active;
+            state.native_mp4_diagnostic = format!(
+                "Native renderer failed during playback; libVLC D3D11VA fallback is active. Cause: {failure}"
+            );
             state.last_error.clear();
         }
         Err(error) => {
-            state.last_error =
-                format!("Native renderer failed and libVLC fallback could not start: {error}")
+            state.video_fallback_status = FallbackStatus::Failed;
+            state.audio_fallback_status = FallbackStatus::Failed;
+            state.last_error = format!(
+                "Native renderer failed and libVLC fallback could not start. Cause: {failure}. Fallback error: {error}"
+            )
         }
     }
 }
@@ -1192,27 +1285,33 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
 /// A late WASAPI/device failure must not stop the native D3D11 video. Restore
 /// only libVLC audio and leave the direct video renderer running.
 fn fallback_audio_to_vlc_if_native_failed(state: &mut EngineState) {
-    let audio_failed = state
+    let failure = state
         .native_audio
         .as_ref()
-        .is_some_and(|audio| audio.has_failed());
-    if !audio_failed {
+        .filter(|audio| audio.has_failed())
+        .map(|audio| audio.failure_diagnostic());
+    let Some(failure) = failure else {
+        return;
+    };
+    if !state.audio_fallback_status.try_begin() {
         return;
     }
     if let Some(audio) = state.native_audio.take() {
         audio.stop();
     }
     if state.player.is_some() {
+        state.audio_fallback_status = FallbackStatus::Active;
         return;
     }
-    let Some(path) = state.active_media.as_deref() else {
+    let Some(path) = state.active_media.clone() else {
+        state.audio_fallback_status = FallbackStatus::Failed;
         state.last_error =
             "Native audio stopped and no wallpaper path is available for fallback.".into();
         return;
     };
     match unsafe {
         vlc::VlcPlayer::start(
-            path,
+            &path,
             state.host_window as usize,
             state.performance_mode,
             false,
@@ -1226,13 +1325,17 @@ fn fallback_audio_to_vlc_if_native_failed(state: &mut EngineState) {
                 player.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
             }
             state.player = Some(player);
-            state.native_audio_diagnostic =
-                "Native audio failed during playback; libVLC audio fallback is active.".into();
+            state.audio_fallback_status = FallbackStatus::Active;
+            state.native_audio_diagnostic = format!(
+                "Native audio failed during playback; libVLC audio fallback is active. Cause: {failure}"
+            );
             state.last_error.clear();
         }
         Err(error) => {
-            state.last_error =
-                format!("Native audio failed and libVLC audio fallback could not start: {error}")
+            state.audio_fallback_status = FallbackStatus::Failed;
+            state.last_error = format!(
+                "Native audio failed and libVLC audio fallback could not start. Cause: {failure}. Fallback error: {error}"
+            )
         }
     }
 }
@@ -1303,4 +1406,27 @@ unsafe extern "system" fn host_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FallbackStatus;
+
+    #[test]
+    fn fallback_can_begin_only_once_until_the_next_wallpaper_resets_it() {
+        let mut status = FallbackStatus::Idle;
+
+        assert!(status.try_begin());
+        assert_eq!(status, FallbackStatus::InProgress);
+        assert!(!status.try_begin());
+
+        status = FallbackStatus::Active;
+        assert!(!status.try_begin());
+
+        status = FallbackStatus::Failed;
+        assert!(!status.try_begin());
+
+        status = FallbackStatus::Idle;
+        assert!(status.try_begin());
+    }
 }
