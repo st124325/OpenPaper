@@ -12,8 +12,9 @@ use url::Url;
 use windows::{
     core::{PCSTR, PCWSTR},
     Win32::{
-        Foundation::FreeLibrary,
+        Foundation::{FreeLibrary, HWND, RECT},
         System::LibraryLoader::{GetProcAddress, LoadLibraryW, SetDllDirectoryW},
+        UI::WindowsAndMessaging::GetClientRect,
     },
 };
 
@@ -28,6 +29,7 @@ type PlayerSetHwnd = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type PlayerPlay = unsafe extern "C" fn(*mut c_void) -> c_int;
 type PlayerSetPause = unsafe extern "C" fn(*mut c_void, c_int);
 type PlayerStop = unsafe extern "C" fn(*mut c_void);
+type VideoSetAspectRatio = unsafe extern "C" fn(*mut c_void, *const c_char);
 type AudioSetMute = unsafe extern "C" fn(*mut c_void, c_int);
 type AudioSetVolume = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 
@@ -53,6 +55,7 @@ impl VlcPlayer {
         hwnd: usize,
         performance_mode: i32,
         show_video: bool,
+        stretch_to_fill: bool,
     ) -> Result<Self, String> {
         let runtime = env::var_os("OPENWALLPAPER_LIBVLC_DIR")
             .map(PathBuf::from)
@@ -89,6 +92,8 @@ impl VlcPlayer {
         let player_set_pause: PlayerSetPause =
             symbol!("libvlc_media_player_set_pause", PlayerSetPause);
         let player_stop: PlayerStop = symbol!("libvlc_media_player_stop", PlayerStop);
+        let video_set_aspect_ratio: VideoSetAspectRatio =
+            symbol!("libvlc_video_set_aspect_ratio", VideoSetAspectRatio);
         let audio_set_mute: AudioSetMute = symbol!("libvlc_audio_set_mute", AudioSetMute);
         let audio_set_volume: AudioSetVolume = symbol!("libvlc_audio_set_volume", AudioSetVolume);
 
@@ -153,6 +158,17 @@ impl VlcPlayer {
 
         if show_video {
             player_set_hwnd(player, hwnd as *mut c_void);
+            if stretch_to_fill {
+                let mut client = RECT::default();
+                if GetClientRect(HWND(hwnd as _), &mut client).is_ok() {
+                    let width = (client.right - client.left).max(1);
+                    let height = (client.bottom - client.top).max(1);
+                    let aspect = CString::new(format!("{width}:{height}")).unwrap();
+                    video_set_aspect_ratio(player, aspect.as_ptr());
+                }
+            } else {
+                video_set_aspect_ratio(player, std::ptr::null());
+            }
         }
         if player_play(player) != 0 {
             player_release(player);

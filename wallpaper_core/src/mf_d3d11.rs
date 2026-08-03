@@ -5,6 +5,7 @@
 //! it replaces the stable libVLC output path.
 
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
         mpsc, Arc, Mutex, OnceLock,
@@ -15,15 +16,19 @@ use std::{
 use windows::{
     core::{implement, IUnknown, Interface, HRESULT, HSTRING, PCWSTR},
     Win32::{
-        Foundation::{BOOL, HMODULE, HWND, RECT},
+        Foundation::{
+            CloseHandle, BOOL, HANDLE, HMODULE, HWND, RECT, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        },
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
                 ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
-                ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+                ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
+                ID3D11VideoProcessorOutputView, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV,
+                D3D11_TEX2D_VPOV, D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0, D3D11_VIDEO_COLOR_RGBA,
                 D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
                 D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
                 D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
@@ -36,9 +41,10 @@ use windows::{
                     DXGI_SAMPLE_DESC,
                 },
                 IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1,
-                IDXGISwapChain3, DXGI_ERROR_WAS_STILL_DRAWING, DXGI_PRESENT_DO_NOT_WAIT,
-                DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-                DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                IDXGISwapChain2, IDXGISwapChain3, DXGI_ERROR_WAS_STILL_DRAWING,
+                DXGI_PRESENT_DO_NOT_WAIT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+                DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+                DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
             },
         },
         Media::MediaFoundation::{
@@ -52,6 +58,7 @@ use windows::{
             MF_SOURCE_READER_DISABLE_DXVA, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
         },
         System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
+        System::Threading::WaitForSingleObject,
     },
 };
 
@@ -64,7 +71,53 @@ struct NativeMp4Pipeline {
     _manager: IMFDXGIDeviceManager,
     reader: Option<IMFSourceReader>,
     swap_chain: IDXGISwapChain1,
+    swap_chain3: IDXGISwapChain3,
+    output_width: u32,
+    output_height: u32,
+    buffer_count: u32,
+    stretch_to_fill: bool,
+    frame_latency: FrameLatencyHandle,
     processor: Option<VideoProcessorResources>,
+}
+
+struct FrameLatencyHandle(HANDLE);
+
+impl Drop for FrameLatencyHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+impl FrameLatencyHandle {
+    unsafe fn new(swap_chain: &IDXGISwapChain1) -> Result<Self, String> {
+        let swap_chain2: IDXGISwapChain2 = swap_chain
+            .cast()
+            .map_err(|error| format!("Could not query IDXGISwapChain2: {error}"))?;
+        swap_chain2
+            .SetMaximumFrameLatency(1)
+            .map_err(|error| format!("Could not set swap-chain frame latency: {error}"))?;
+        let handle = swap_chain2.GetFrameLatencyWaitableObject();
+        if handle.0.is_null() {
+            return Err("DXGI returned no frame-latency waitable object.".into());
+        }
+        Ok(Self(handle))
+    }
+
+    unsafe fn wait(&self) -> Result<bool, String> {
+        match WaitForSingleObject(self.0, 100) {
+            status if status == WAIT_OBJECT_0 => Ok(true),
+            status if status == WAIT_TIMEOUT => Ok(false),
+            status if status == WAIT_FAILED => {
+                Err("Waiting for the DXGI frame-latency object failed.".into())
+            }
+            status => Err(format!(
+                "DXGI returned an unexpected wait status: 0x{:08X}.",
+                status.0
+            )),
+        }
+    }
 }
 
 /// Objects whose creation is expensive. They are retained for every frame
@@ -72,14 +125,24 @@ struct NativeMp4Pipeline {
 struct VideoProcessorResources {
     input_width: u32,
     input_height: u32,
-    output_width: u32,
-    output_height: u32,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     _enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
     output_views: Vec<ID3D11VideoProcessorOutputView>,
+    input_views: HashMap<(usize, u32), CachedInputView>,
+    input_view_epoch: u64,
 }
+
+struct CachedInputView {
+    // Keeping the texture alive makes its COM identity a safe cache key and
+    // prevents another decoder surface from reusing the same pointer value.
+    _texture: ID3D11Texture2D,
+    view: ID3D11VideoProcessorInputView,
+    last_used: u64,
+}
+
+const MAX_CACHED_INPUT_VIEWS: usize = 16;
 
 /// Owns the native render thread. Dropping it requests a clean stop and joins
 /// the thread, so a stopped wallpaper never leaves a D3D swap chain behind.
@@ -525,10 +588,6 @@ unsafe fn create_video_processor_resources(
     input_width: u32,
     input_height: u32,
 ) -> Result<VideoProcessorResources, String> {
-    let swap_description = pipeline
-        .swap_chain
-        .GetDesc1()
-        .map_err(|error| format!("Could not read the D3D11 swap-chain description: {error}"))?;
     let video_device: ID3D11VideoDevice = pipeline
         .device
         .cast()
@@ -549,8 +608,8 @@ unsafe fn create_video_processor_resources(
             Numerator: 60,
             Denominator: 1,
         },
-        OutputWidth: swap_description.Width,
-        OutputHeight: swap_description.Height,
+        OutputWidth: pipeline.output_width,
+        OutputHeight: pipeline.output_height,
         Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
     };
     let enumerator = video_device
@@ -565,8 +624,8 @@ unsafe fn create_video_processor_resources(
             Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
         },
     };
-    let mut output_views = Vec::with_capacity(swap_description.BufferCount as usize);
-    for index in 0..swap_description.BufferCount {
+    let mut output_views = Vec::with_capacity(pipeline.buffer_count as usize);
+    for index in 0..pipeline.buffer_count {
         let texture: ID3D11Texture2D = pipeline
             .swap_chain
             .GetBuffer(index)
@@ -590,11 +649,18 @@ unsafe fn create_video_processor_resources(
         right: input_width as i32,
         bottom: input_height as i32,
     };
-    let destination = RECT {
+    let destination = destination_rect(
+        input_width,
+        input_height,
+        pipeline.output_width,
+        pipeline.output_height,
+        pipeline.stretch_to_fill,
+    );
+    let output_target = RECT {
         left: 0,
         top: 0,
-        right: swap_description.Width as i32,
-        bottom: swap_description.Height as i32,
+        right: pipeline.output_width as i32,
+        bottom: pipeline.output_height as i32,
     };
     video_context.VideoProcessorSetStreamFrameFormat(
         &processor,
@@ -603,18 +669,127 @@ unsafe fn create_video_processor_resources(
     );
     video_context.VideoProcessorSetStreamSourceRect(&processor, 0, BOOL(1), Some(&source));
     video_context.VideoProcessorSetStreamDestRect(&processor, 0, BOOL(1), Some(&destination));
-    video_context.VideoProcessorSetOutputTargetRect(&processor, BOOL(1), Some(&destination));
+    video_context.VideoProcessorSetOutputTargetRect(&processor, BOOL(1), Some(&output_target));
+    let black = D3D11_VIDEO_COLOR {
+        Anonymous: D3D11_VIDEO_COLOR_0 {
+            RGBA: D3D11_VIDEO_COLOR_RGBA {
+                R: 0.0,
+                G: 0.0,
+                B: 0.0,
+                A: 1.0,
+            },
+        },
+    };
+    video_context.VideoProcessorSetOutputBackgroundColor(&processor, BOOL(0), &black);
     Ok(VideoProcessorResources {
         input_width,
         input_height,
-        output_width: swap_description.Width,
-        output_height: swap_description.Height,
         video_device,
         video_context,
         _enumerator: enumerator,
         processor,
         output_views,
+        input_views: HashMap::with_capacity(MAX_CACHED_INPUT_VIEWS),
+        input_view_epoch: 0,
     })
+}
+
+fn destination_rect(
+    input_width: u32,
+    input_height: u32,
+    output_width: u32,
+    output_height: u32,
+    stretch_to_fill: bool,
+) -> RECT {
+    if stretch_to_fill || input_width == 0 || input_height == 0 {
+        return RECT {
+            left: 0,
+            top: 0,
+            right: output_width as i32,
+            bottom: output_height as i32,
+        };
+    }
+
+    let (width, height) = if u64::from(output_width) * u64::from(input_height)
+        <= u64::from(output_height) * u64::from(input_width)
+    {
+        let height =
+            (u64::from(output_width) * u64::from(input_height) / u64::from(input_width)) as u32;
+        (output_width, height.max(1))
+    } else {
+        let width =
+            (u64::from(output_height) * u64::from(input_width) / u64::from(input_height)) as u32;
+        (width.max(1), output_height)
+    };
+    let left = (output_width.saturating_sub(width) / 2) as i32;
+    let top = (output_height.saturating_sub(height) / 2) as i32;
+    RECT {
+        left,
+        top,
+        right: left + width as i32,
+        bottom: top + height as i32,
+    }
+}
+
+fn take_cached_input_view(
+    resources: &mut VideoProcessorResources,
+    key: (usize, u32),
+) -> Option<ID3D11VideoProcessorInputView> {
+    resources.input_view_epoch = resources.input_view_epoch.wrapping_add(1);
+    let epoch = resources.input_view_epoch;
+    let cached = resources.input_views.get_mut(&key)?;
+    cached.last_used = epoch;
+    Some(cached.view.clone())
+}
+
+unsafe fn create_cached_input_view(
+    resources: &mut VideoProcessorResources,
+    input_texture: &ID3D11Texture2D,
+    input_subresource: u32,
+) -> Result<ID3D11VideoProcessorInputView, String> {
+    let input_description = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+        FourCC: 0,
+        ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_VPIV {
+                MipSlice: 0,
+                ArraySlice: input_subresource,
+            },
+        },
+    };
+    let mut input_view = None;
+    resources
+        .video_device
+        .CreateVideoProcessorInputView(
+            input_texture,
+            &resources._enumerator,
+            &input_description,
+            Some(&mut input_view),
+        )
+        .map_err(|error| format!("Could not create the NV12 input view: {error}"))?;
+    let input_view = input_view.ok_or_else(|| "D3D11 returned no NV12 input view.".to_string())?;
+
+    if resources.input_views.len() >= MAX_CACHED_INPUT_VIEWS {
+        if let Some(stale_key) = resources
+            .input_views
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used)
+            .map(|(key, _)| *key)
+        {
+            resources.input_views.remove(&stale_key);
+        }
+    }
+    resources.input_view_epoch = resources.input_view_epoch.wrapping_add(1);
+    let key = (input_texture.as_raw() as usize, input_subresource);
+    resources.input_views.insert(
+        key,
+        CachedInputView {
+            _texture: input_texture.clone(),
+            view: input_view.clone(),
+            last_used: resources.input_view_epoch,
+        },
+    );
+    Ok(input_view)
 }
 
 /// Transfers one decoder-owned NV12 texture into the current BGRA swap-chain
@@ -624,6 +799,13 @@ unsafe fn present_nv12_sample(
     pipeline: &mut NativeMp4Pipeline,
     sample: &windows::Win32::Media::MediaFoundation::IMFSample,
 ) -> Result<(), String> {
+    // DXGI signals only when a back buffer is available. Waiting here avoids
+    // waking the render loop just to discover that DWM is still presenting
+    // the previous frame. A timeout drops this frame rather than stalling the
+    // decoder or preventing shutdown.
+    if !pipeline.frame_latency.wait()? {
+        return Ok(());
+    }
     let buffer = sample
         .GetBufferByIndex(0)
         .map_err(|error| format!("Could not get the decoded video buffer: {error}"))?;
@@ -640,57 +822,44 @@ unsafe fn present_nv12_sample(
         .GetSubresourceIndex()
         .map_err(|error| format!("Could not get the NV12 texture subresource: {error}"))?;
 
-    let mut input_size = Default::default();
-    input_texture.GetDesc(&mut input_size);
-    let swap_description = pipeline
-        .swap_chain
-        .GetDesc1()
-        .map_err(|error| format!("Could not read the D3D11 swap-chain description: {error}"))?;
-    let needs_rebuild = pipeline.processor.as_ref().is_none_or(|resources| {
-        resources.input_width != input_size.Width
-            || resources.input_height != input_size.Height
-            || resources.output_width != swap_description.Width
-            || resources.output_height != swap_description.Height
-    });
-    if needs_rebuild {
-        pipeline.processor = Some(create_video_processor_resources(
-            pipeline,
-            input_size.Width,
-            input_size.Height,
-        )?);
-    }
+    let input_key = (input_texture.as_raw() as usize, input_subresource);
+    let cached_input_view = pipeline
+        .processor
+        .as_mut()
+        .and_then(|resources| take_cached_input_view(resources, input_key));
+    let input_view = if let Some(input_view) = cached_input_view {
+        input_view
+    } else {
+        // Texture descriptions are invariant for a decoder surface. Query
+        // only the first time a surface appears; format-change events clear
+        // the whole processor/cache before the next frame arrives.
+        let mut input_size = Default::default();
+        input_texture.GetDesc(&mut input_size);
+        let needs_rebuild = pipeline.processor.as_ref().is_none_or(|resources| {
+            resources.input_width != input_size.Width || resources.input_height != input_size.Height
+        });
+        if needs_rebuild {
+            pipeline.processor = Some(create_video_processor_resources(
+                pipeline,
+                input_size.Width,
+                input_size.Height,
+            )?);
+        }
+        create_cached_input_view(
+            pipeline
+                .processor
+                .as_mut()
+                .expect("processor resources were just created"),
+            &input_texture,
+            input_subresource,
+        )?
+    };
+
     let resources = pipeline
         .processor
         .as_ref()
         .expect("processor resources were just created");
-
-    let input_description = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-        FourCC: 0,
-        ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-        Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-            Texture2D: D3D11_TEX2D_VPIV {
-                MipSlice: 0,
-                ArraySlice: input_subresource,
-            },
-        },
-    };
-    let mut input_view = None;
-    resources
-        .video_device
-        .CreateVideoProcessorInputView(
-            &input_texture,
-            &resources._enumerator,
-            &input_description,
-            Some(&mut input_view),
-        )
-        .map_err(|error| format!("Could not create the NV12 input view: {error}"))?;
-    let input_view = input_view.ok_or_else(|| "D3D11 returned no NV12 input view.".to_string())?;
-
-    let swap_chain3: IDXGISwapChain3 = pipeline
-        .swap_chain
-        .cast()
-        .map_err(|error| format!("Could not query IDXGISwapChain3: {error}"))?;
-    let current_buffer = swap_chain3.GetCurrentBackBufferIndex() as usize;
+    let current_buffer = pipeline.swap_chain3.GetCurrentBackBufferIndex() as usize;
     let output_view = resources.output_views.get(current_buffer).ok_or_else(|| {
         format!("Swap chain returned invalid back-buffer index {current_buffer}.")
     })?;
@@ -850,7 +1019,7 @@ unsafe fn create_pipeline(
             // guarantee and failed on the second buffer in real testing.
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-            Flags: 0,
+            Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
         };
         let swap_chain = factory
             .CreateSwapChainForHwnd(
@@ -861,6 +1030,13 @@ unsafe fn create_pipeline(
                 None::<&IDXGIOutput>,
             )
             .map_err(|error| format!("Could not create the D3D11 swap chain: {error}"))?;
+        let swap_chain3: IDXGISwapChain3 = swap_chain
+            .cast()
+            .map_err(|error| format!("Could not query IDXGISwapChain3: {error}"))?;
+        let swap_chain_info = swap_chain
+            .GetDesc1()
+            .map_err(|error| format!("Could not read the D3D11 swap-chain description: {error}"))?;
+        let frame_latency = FrameLatencyHandle::new(&swap_chain)?;
 
         Ok(NativeMp4Pipeline {
             device,
@@ -868,6 +1044,12 @@ unsafe fn create_pipeline(
             _manager: manager,
             reader: Some(reader),
             swap_chain,
+            swap_chain3,
+            output_width: swap_chain_info.Width,
+            output_height: swap_chain_info.Height,
+            buffer_count: swap_chain_info.BufferCount,
+            stretch_to_fill: true,
+            frame_latency,
             processor: None,
         })
     }
@@ -886,6 +1068,7 @@ impl ExternalNv12Presenter {
         context: ID3D11DeviceContext,
         manager: IMFDXGIDeviceManager,
         host: HWND,
+        stretch_to_fill: bool,
     ) -> Result<Self, String> {
         let dxgi_device: IDXGIDevice = device
             .cast()
@@ -910,11 +1093,18 @@ impl ExternalNv12Presenter {
             Scaling: DXGI_SCALING_STRETCH,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-            Flags: 0,
+            Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
         };
         let swap_chain = factory
             .CreateSwapChainForHwnd(&device, host, &description, None, None::<&IDXGIOutput>)
             .map_err(|error| format!("Could not create direct D3D11 swap chain: {error}"))?;
+        let swap_chain3: IDXGISwapChain3 = swap_chain
+            .cast()
+            .map_err(|error| format!("Could not query IDXGISwapChain3: {error}"))?;
+        let swap_chain_info = swap_chain
+            .GetDesc1()
+            .map_err(|error| format!("Could not read the D3D11 swap-chain description: {error}"))?;
+        let frame_latency = FrameLatencyHandle::new(&swap_chain)?;
         Ok(Self {
             pipeline: NativeMp4Pipeline {
                 device,
@@ -922,6 +1112,12 @@ impl ExternalNv12Presenter {
                 _manager: manager,
                 reader: None,
                 swap_chain,
+                swap_chain3,
+                output_width: swap_chain_info.Width,
+                output_height: swap_chain_info.Height,
+                buffer_count: swap_chain_info.BufferCount,
+                stretch_to_fill,
+                frame_latency,
                 processor: None,
             },
         })
@@ -932,5 +1128,37 @@ impl ExternalNv12Presenter {
         sample: &windows::Win32::Media::MediaFoundation::IMFSample,
     ) -> Result<(), String> {
         present_nv12_sample(&mut self.pipeline, sample)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::destination_rect;
+
+    #[test]
+    fn stretch_uses_the_complete_output() {
+        let rect = destination_rect(1_920, 1_080, 1_280, 1_024, true);
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (0, 0, 1_280, 1_024)
+        );
+    }
+
+    #[test]
+    fn preserve_aspect_centers_letterbox_bars() {
+        let rect = destination_rect(1_920, 1_080, 1_280, 1_024, false);
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (0, 152, 1_280, 872)
+        );
+    }
+
+    #[test]
+    fn preserve_aspect_centers_pillarbox_bars() {
+        let rect = destination_rect(1_080, 1_920, 1_920, 1_080, false);
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (656, 0, 1_263, 1_080)
+        );
     }
 }

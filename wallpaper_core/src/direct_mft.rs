@@ -3,6 +3,9 @@
 //! MP4 demuxing, hardware decoding and presentation stay on one MTA thread;
 //! decoded NV12 surfaces remain in GPU memory through the VideoProcessor blit.
 
+use crate::media_event_queue::{EventOrigin, MediaEventSubscription, QueuedMediaEvent};
+use crate::playback_clock::PlaybackClock;
+
 use std::{
     collections::VecDeque,
     mem::ManuallyDrop,
@@ -31,16 +34,17 @@ use windows::{
         Media::MediaFoundation::{
             IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaSource, IMFMediaStream,
             IMFPresentationDescriptor, IMFSample, IMFShutdown, IMFTransform, MEEndOfStream,
-            MEMediaSample, MENewStream, MEStreamStarted, METransformHaveOutput,
-            METransformNeedInput, MFCreateDXGIDeviceManager, MFCreateSourceResolver,
-            MFMediaType_Video, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_HEVC,
-            MFVideoFormat_NV12, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ALL,
-            MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
-            MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-            MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
-            MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO,
-            MF_EVENT_FLAG_NO_WAIT, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
-            MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_OBJECT_TYPE,
+            MEMediaSample, MENewStream, MEStreamStarted, METransformDrainComplete,
+            METransformHaveOutput, METransformNeedInput, MFCreateDXGIDeviceManager,
+            MFCreateSourceResolver, MFMediaType_Video, MFTEnumEx, MFVideoFormat_H264,
+            MFVideoFormat_HEVC, MFVideoFormat_NV12, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG,
+            MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
+            MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+            MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+            MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+            MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
+            MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+            MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_OBJECT_TYPE, MF_PD_DURATION,
             MF_RESOLUTION_MEDIASOURCE, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC,
             MF_TRANSFORM_ASYNC_UNLOCK,
         },
@@ -361,13 +365,26 @@ impl DirectDecoderSession {
     pub(crate) unsafe fn create_presenter(
         &self,
         host: HWND,
+        stretch_to_fill: bool,
     ) -> Result<crate::mf_d3d11::ExternalNv12Presenter, String> {
         crate::mf_d3d11::ExternalNv12Presenter::new(
             self.device.clone(),
             self.context.clone(),
             self.manager.clone(),
             host,
+            stretch_to_fill,
         )
+    }
+
+    /// Resets codec queues after a completed drain while preserving the MFT,
+    /// DXGI device manager and its decoder surface pool for the next loop.
+    unsafe fn reset_for_next_stream(&self) -> Result<(), String> {
+        self.decoder
+            .ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
+            .map_err(|e| format!("Hardware MFT flush before loop failed: {e}"))?;
+        self.decoder
+            .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+            .map_err(|e| format!("Hardware MFT restart after loop failed: {e}"))
     }
 }
 
@@ -473,7 +490,7 @@ pub fn decode_first_direct_mp4_sample_to_nv12(
 
 pub fn decode_and_present_first_direct_mp4_sample(path: &str, host: HWND) -> Result<(), String> {
     let session = create_gpu_decoder_session_for_mp4(path)?;
-    let mut presenter = unsafe { session.create_presenter(host)? };
+    let mut presenter = unsafe { session.create_presenter(host, true)? };
     let sample = read_first_direct_video_sample(path, Duration::from_secs(3))?;
     let nv12 = unsafe { process_sample_to_nv12(&session, &sample)? };
     unsafe { presenter.present(&nv12) }
@@ -529,17 +546,24 @@ pub struct DirectMp4Renderer {
     activated: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     frames_presented: Arc<AtomicU64>,
+    events_received: Arc<AtomicU64>,
     finished: Arc<AtomicBool>,
     worker: JoinHandle<()>,
 }
 
 impl DirectMp4Renderer {
-    pub fn start(path: String, host: HWND) -> Result<Self, String> {
+    pub fn start(
+        path: String,
+        host: HWND,
+        playback_clock: Arc<PlaybackClock>,
+        stretch_to_fill: bool,
+    ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let activated = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
         let frames_presented = Arc::new(AtomicU64::new(0));
+        let events_received = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let host_value = host.0 as isize;
@@ -549,7 +573,9 @@ impl DirectMp4Renderer {
         let worker_activated = Arc::clone(&activated);
         let worker_failed = Arc::clone(&failed);
         let worker_frames = Arc::clone(&frames_presented);
+        let worker_events = Arc::clone(&events_received);
         let worker_finished = Arc::clone(&finished);
+        let worker_clock = Arc::clone(&playback_clock);
         let worker = thread::spawn(move || unsafe {
             let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
             let result = if initialized {
@@ -560,7 +586,10 @@ impl DirectMp4Renderer {
                     &worker_paused,
                     &worker_activated,
                     &worker_frames,
+                    &worker_events,
                     &ready_tx,
+                    &worker_clock,
+                    stretch_to_fill,
                 )
             } else {
                 Err("Could not initialize the native renderer COM apartment.".into())
@@ -584,6 +613,7 @@ impl DirectMp4Renderer {
                 activated,
                 failed,
                 frames_presented,
+                events_received,
                 finished,
                 worker,
             }),
@@ -635,11 +665,9 @@ impl DirectMp4Renderer {
         self.frames_presented.load(Ordering::Acquire)
     }
 
-    // Kept for ABI-compatible diagnostic exports that formerly described the
-    // Source Reader callback backend. The direct Media Source path has no such
-    // callback or request HRESULTs.
+    /// Counts asynchronous source, stream, and hardware-MFT callbacks.
     pub fn callbacks_received(&self) -> u64 {
-        0
+        self.events_received.load(Ordering::Acquire)
     }
 
     pub fn last_callback_status(&self) -> i32 {
@@ -655,44 +683,143 @@ impl DirectMp4Renderer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn run_direct_playback(
     path: &str,
     host: HWND,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
     paused: &AtomicBool,
     activated: &AtomicBool,
     frames_presented: &AtomicU64,
+    events_received: &Arc<AtomicU64>,
     ready: &mpsc::SyncSender<Result<(), String>>,
+    playback_clock: &PlaybackClock,
+    stretch_to_fill: bool,
 ) -> Result<(), String> {
+    // These are the expensive objects. Keep them alive for the entire
+    // wallpaper session instead of rebuilding the D3D11/DXVA pipeline at EOF.
+    let session = create_gpu_decoder_session_for_mp4(path)?;
+    let mut presenter = session.create_presenter(host, stretch_to_fill)?;
+    let mut prepared_source = prepare_video_source(path)?;
+    let (event_tx, event_rx) = mpsc::channel::<QueuedMediaEvent>();
+    let _transform_subscription = session
+        .events
+        .as_ref()
+        .map(|events| {
+            MediaEventSubscription::start(
+                events,
+                EventOrigin::Transform,
+                event_tx.clone(),
+                Arc::clone(stop),
+                Arc::clone(events_received),
+            )
+        })
+        .transpose()?;
+    let mut timeline_offset_100ns = 0u64;
+    let mut cycle_generation = 0u64;
     while !stop.load(Ordering::Acquire) {
-        run_direct_playback_cycle(path, host, stop, paused, activated, frames_presented, ready)?;
+        let cycle = run_direct_playback_cycle(
+            path,
+            &session,
+            &mut presenter,
+            prepared_source,
+            stop,
+            paused,
+            activated,
+            frames_presented,
+            ready,
+            playback_clock,
+            timeline_offset_100ns,
+            cycle_generation,
+            &event_tx,
+            &event_rx,
+            events_received,
+        )?;
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        timeline_offset_100ns = timeline_offset_100ns.saturating_add(cycle.duration_100ns);
+        while event_rx.try_recv().is_ok() {}
+        session.reset_for_next_stream()?;
+        cycle_generation = cycle_generation.wrapping_add(1);
+        prepared_source = cycle
+            .next_source
+            .ok_or_else(|| "The next MP4 loop was not prepared in time.".to_string())?;
     }
     Ok(())
+}
+
+struct PreparedVideoSource {
+    source: IMFMediaSource,
+    descriptor: IMFPresentationDescriptor,
+    duration_100ns: u64,
+}
+
+impl Drop for PreparedVideoSource {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.source.Shutdown();
+        }
+    }
+}
+
+struct PlaybackCycleResult {
+    duration_100ns: u64,
+    next_source: Option<PreparedVideoSource>,
+}
+
+unsafe fn prepare_video_source(path: &str) -> Result<PreparedVideoSource, String> {
+    let source = resolve_media_source(path)?;
+    let descriptor = source
+        .CreatePresentationDescriptor()
+        .map_err(|e| format!("MP4 presentation descriptor: {e}"))?;
+    let duration_100ns = descriptor.GetUINT64(&MF_PD_DURATION).unwrap_or(0);
+    select_only_video_stream(&descriptor)?;
+    Ok(PreparedVideoSource {
+        source,
+        descriptor,
+        duration_100ns,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn run_direct_playback_cycle(
     path: &str,
-    host: HWND,
-    stop: &AtomicBool,
+    session: &DirectDecoderSession,
+    presenter: &mut crate::mf_d3d11::ExternalNv12Presenter,
+    prepared_source: PreparedVideoSource,
+    stop: &Arc<AtomicBool>,
     paused: &AtomicBool,
     activated: &AtomicBool,
     frames_presented: &AtomicU64,
     ready: &mpsc::SyncSender<Result<(), String>>,
-) -> Result<(), String> {
-    let session = create_gpu_decoder_session_for_mp4(path)?;
-    let mut presenter = session.create_presenter(host)?;
-    let source = resolve_media_source(path)?;
-    let result = (|| -> Result<(), String> {
-        let descriptor = source
-            .CreatePresentationDescriptor()
-            .map_err(|e| format!("MP4 presentation descriptor: {e}"))?;
-        select_only_video_stream(&descriptor)?;
+    playback_clock: &PlaybackClock,
+    timeline_offset_100ns: u64,
+    cycle_generation: u64,
+    event_tx: &mpsc::Sender<QueuedMediaEvent>,
+    event_rx: &mpsc::Receiver<QueuedMediaEvent>,
+    events_received: &Arc<AtomicU64>,
+) -> Result<PlaybackCycleResult, String> {
+    let source = &prepared_source.source;
+    let descriptor = &prepared_source.descriptor;
+    let declared_duration_100ns = prepared_source.duration_100ns;
+    let source_events: IMFMediaEventGenerator = source
+        .cast()
+        .map_err(|e| format!("Could not subscribe to MP4 source events: {e}"))?;
+    let _source_subscription = MediaEventSubscription::start(
+        &source_events,
+        EventOrigin::Source(cycle_generation),
+        event_tx.clone(),
+        Arc::clone(stop),
+        Arc::clone(events_received),
+    )?;
+    let result = (|| -> Result<PlaybackCycleResult, String> {
         source
-            .Start(&descriptor, std::ptr::null(), &PROPVARIANT::default())
+            .Start(descriptor, std::ptr::null(), &PROPVARIANT::default())
             .map_err(|e| format!("MP4 source start: {e}"))?;
 
         let mut stream: Option<IMFMediaStream> = None;
+        let mut _stream_subscription = None::<MediaEventSubscription>;
         let mut compressed: VecDeque<IMFSample> = VecDeque::with_capacity(8);
         let mut decoded: VecDeque<IMFSample> = VecDeque::with_capacity(3);
         let mut pending_need_input = 0u32;
@@ -701,44 +828,98 @@ unsafe fn run_direct_playback_cycle(
         let mut request_pending = false;
         let mut end_of_stream = false;
         let mut drain_started = false;
+        let mut drain_complete = false;
+        let mut next_source = None;
         let mut last_progress = Instant::now();
-        let mut last_output = Instant::now();
         let mut last_presented = Instant::now();
-        let mut clock_media = None::<i64>;
-        let mut clock_wall = None::<Instant>;
+        let mut presentation_clock = PresentationClock::new(timeline_offset_100ns);
+        let mut queued_events = VecDeque::<QueuedMediaEvent>::with_capacity(16);
 
         while !stop.load(Ordering::Acquire) {
-            if let Some(events) = session.events.as_ref() {
-                for _ in 0..64 {
-                    // Do not consume another HaveOutput event until there is
-                    // room for its GPU surface. This is real back-pressure:
-                    // dropping here caused periodic timestamp gaps and made a
-                    // 30 FPS source visibly run at roughly 12 FPS.
-                    if decoded.len() >= 3 {
-                        break;
+            while let Ok(event) = event_rx.try_recv() {
+                queued_events.push_back(event);
+            }
+            for _ in 0..128 {
+                let Some(queued) = queued_events.pop_front() else {
+                    break;
+                };
+                let relevant = match queued.origin {
+                    EventOrigin::Transform => true,
+                    EventOrigin::Source(generation) | EventOrigin::Stream(generation) => {
+                        generation == cycle_generation
                     }
-                    let Ok(event) = events.GetEvent(MF_EVENT_FLAG_NO_WAIT) else {
-                        break;
-                    };
-                    match event.GetType().unwrap_or_default() {
+                };
+                if !relevant {
+                    continue;
+                }
+                let event = queued.event?;
+                let kind = event.GetType().unwrap_or_default();
+                match queued.origin {
+                    EventOrigin::Transform => match kind {
                         kind if kind == METransformNeedInput.0 as u32 => {
                             pending_need_input = pending_need_input.saturating_add(1).min(64);
                         }
                         kind if kind == METransformHaveOutput.0 as u32 => {
                             decoder_output_ready = true;
-                            break;
+                        }
+                        kind if kind == METransformDrainComplete.0 as u32 => {
+                            drain_complete = true;
                         }
                         _ => {}
+                    },
+                    EventOrigin::Source(_) if kind == MENewStream.0 as u32 => {
+                        let value = event
+                            .GetValue()
+                            .map_err(|e| format!("MP4 stream event: {e}"))?;
+                        let object = IUnknown::try_from(&value)
+                            .map_err(|e| format!("MP4 stream object: {e}"))?;
+                        let media_stream: IMFMediaStream =
+                            object.cast().map_err(|e| format!("MP4 stream cast: {e}"))?;
+                        let generator: IMFMediaEventGenerator = media_stream
+                            .cast()
+                            .map_err(|e| format!("MP4 stream event generator: {e}"))?;
+                        _stream_subscription = Some(MediaEventSubscription::start(
+                            &generator,
+                            EventOrigin::Stream(cycle_generation),
+                            event_tx.clone(),
+                            Arc::clone(stop),
+                            Arc::clone(events_received),
+                        )?);
+                        stream = Some(media_stream);
                     }
+                    EventOrigin::Stream(_) if kind == MEStreamStarted.0 as u32 => {
+                        stream_started = true;
+                    }
+                    EventOrigin::Stream(_) if kind == MEMediaSample.0 as u32 => {
+                        request_pending = false;
+                        let value = event
+                            .GetValue()
+                            .map_err(|e| format!("MP4 sample event: {e}"))?;
+                        let object = IUnknown::try_from(&value)
+                            .map_err(|e| format!("MP4 sample object: {e}"))?;
+                        let sample: IMFSample =
+                            object.cast().map_err(|e| format!("MP4 sample cast: {e}"))?;
+                        compressed.push_back(sample);
+                    }
+                    EventOrigin::Stream(_) if kind == MEEndOfStream.0 as u32 => {
+                        request_pending = false;
+                        end_of_stream = true;
+                    }
+                    _ => {}
                 }
+                last_progress = Instant::now();
+            }
+
+            if session.events.is_some() {
                 while decoder_output_ready && decoded.len() < 3 {
-                    match try_process_output(&session)? {
+                    match try_process_output(session)? {
                         Some(frame) => {
                             decoded.push_back(frame);
                             last_progress = Instant::now();
-                            last_output = last_progress;
                         }
-                        None => decoder_output_ready = false,
+                        None => {
+                            decoder_output_ready = false;
+                        }
                     }
                 }
                 while pending_need_input > 0 && !decoder_output_ready {
@@ -758,13 +939,17 @@ unsafe fn run_direct_playback_cycle(
                 // it, and resume ProcessOutput on the next pump iteration.
                 for _ in 0..64 {
                     while decoder_output_ready && decoded.len() < 3 {
-                        match try_process_output(&session)? {
+                        match try_process_output(session)? {
                             Some(frame) => {
                                 decoded.push_back(frame);
                                 last_progress = Instant::now();
-                                last_output = last_progress;
                             }
-                            None => decoder_output_ready = false,
+                            None => {
+                                decoder_output_ready = false;
+                                if drain_started {
+                                    drain_complete = true;
+                                }
+                            }
                         }
                     }
                     if decoded.len() >= 3 || compressed.is_empty() {
@@ -788,17 +973,21 @@ unsafe fn run_direct_playback_cycle(
             }
 
             while let Some(frame) = decoded.pop_front() {
-                wait_for_presentation_time(
+                let should_present = wait_for_presentation_time(
                     &frame,
                     stop,
                     paused,
                     activated,
-                    &mut clock_media,
-                    &mut clock_wall,
+                    playback_clock,
+                    &mut presentation_clock,
                     frames_presented.load(Ordering::Acquire) == 0,
                 );
                 if stop.load(Ordering::Acquire) {
                     break;
+                }
+                if !should_present {
+                    last_progress = Instant::now();
+                    continue;
                 }
                 presenter.present(&frame)?;
                 let previous = frames_presented.fetch_add(1, Ordering::AcqRel);
@@ -806,80 +995,15 @@ unsafe fn run_direct_playback_cycle(
                     let _ = ready.try_send(Ok(()));
                 }
                 last_progress = Instant::now();
-                last_output = last_progress;
                 last_presented = last_progress;
             }
 
             if let Some(active_stream) = stream.as_ref() {
-                if let Ok(event) = active_stream.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
-                    match event.GetType().unwrap_or_default() {
-                        kind if kind == MEStreamStarted.0 as u32 => {
-                            stream_started = true;
-                            last_progress = Instant::now();
-                        }
-                        kind if kind == MEMediaSample.0 as u32 => {
-                            request_pending = false;
-                            let value = event
-                                .GetValue()
-                                .map_err(|e| format!("MP4 sample event: {e}"))?;
-                            let object = IUnknown::try_from(&value)
-                                .map_err(|e| format!("MP4 sample object: {e}"))?;
-                            let sample: IMFSample =
-                                object.cast().map_err(|e| format!("MP4 sample cast: {e}"))?;
-                            compressed.push_back(sample);
-                            last_progress = Instant::now();
-                        }
-                        kind if kind == MEEndOfStream.0 as u32 => {
-                            request_pending = false;
-                            end_of_stream = true;
-                            last_progress = Instant::now();
-                        }
-                        _ => {}
-                    }
-                }
                 if stream_started && !end_of_stream && !request_pending && compressed.len() < 8 {
                     active_stream
                         .RequestSample(None::<&IUnknown>)
                         .map_err(|e| format!("MP4 RequestSample: {e}"))?;
                     request_pending = true;
-                }
-            } else {
-                match source.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
-                    Ok(event) if event.GetType().ok() == Some(MENewStream.0 as u32) => {
-                        let value = event
-                            .GetValue()
-                            .map_err(|e| format!("MP4 stream event: {e}"))?;
-                        let object = IUnknown::try_from(&value)
-                            .map_err(|e| format!("MP4 stream object: {e}"))?;
-                        stream = Some(object.cast().map_err(|e| format!("MP4 stream cast: {e}"))?);
-                        last_progress = Instant::now();
-                    }
-                    Ok(_) | Err(_) => {}
-                }
-            }
-
-            if session.events.is_none() {
-                while let Some(frame) = decoded.pop_front() {
-                    wait_for_presentation_time(
-                        &frame,
-                        stop,
-                        paused,
-                        activated,
-                        &mut clock_media,
-                        &mut clock_wall,
-                        frames_presented.load(Ordering::Acquire) == 0,
-                    );
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    presenter.present(&frame)?;
-                    let previous = frames_presented.fetch_add(1, Ordering::AcqRel);
-                    if previous == 0 {
-                        let _ = ready.try_send(Ok(()));
-                    }
-                    last_progress = Instant::now();
-                    last_output = last_progress;
-                    last_presented = last_progress;
                 }
             }
 
@@ -896,13 +1020,20 @@ unsafe fn run_direct_playback_cycle(
                     decoder_output_ready = true;
                 }
                 drain_started = true;
-                last_output = Instant::now();
             }
-            if drain_started
-                && decoded.is_empty()
-                && last_output.elapsed() >= Duration::from_millis(150)
-            {
-                return Ok(());
+            if end_of_stream && next_source.is_none() && !stop.load(Ordering::Acquire) {
+                // Resolve and configure the next Media Source while the MFT is
+                // still draining its final GPU frames. This removes file-open
+                // work from the visible loop boundary.
+                next_source = Some(prepare_video_source(path)?);
+            }
+            if drain_started && drain_complete && decoded.is_empty() {
+                return Ok(PlaybackCycleResult {
+                    duration_100ns: presentation_clock
+                        .cycle_end_100ns
+                        .max(declared_duration_100ns),
+                    next_source,
+                });
             }
             if last_progress.elapsed() >= Duration::from_secs(8) {
                 return Err("Direct native renderer stalled while waiting for MP4 frames.".into());
@@ -914,13 +1045,48 @@ unsafe fn run_direct_playback_cycle(
             {
                 return Err("Direct native renderer stopped presenting GPU frames.".into());
             }
-            thread::sleep(Duration::from_millis(1));
+            // No busy polling: callbacks wake this thread when the source,
+            // stream, or asynchronous MFT has actual work. The bounded wait
+            // keeps stop/pause watchdog response deterministic.
+            match event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => queued_events.push_back(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Media Foundation event channel disconnected.".into());
+                }
+            }
         }
-        Ok(())
+        Ok(PlaybackCycleResult {
+            duration_100ns: presentation_clock
+                .cycle_end_100ns
+                .max(declared_duration_100ns),
+            next_source,
+        })
     })();
     let _ = source.Stop();
-    let _ = source.Shutdown();
     result
+}
+
+struct PresentationClock {
+    media_origin_100ns: Option<i64>,
+    wall_media_anchor_100ns: u64,
+    wall_origin: Instant,
+    was_audio_active: bool,
+    timeline_offset_100ns: u64,
+    cycle_end_100ns: u64,
+}
+
+impl PresentationClock {
+    fn new(timeline_offset_100ns: u64) -> Self {
+        Self {
+            media_origin_100ns: None,
+            wall_media_anchor_100ns: 0,
+            wall_origin: Instant::now(),
+            was_audio_active: false,
+            timeline_offset_100ns,
+            cycle_end_100ns: 0,
+        }
+    }
 }
 
 unsafe fn wait_for_presentation_time(
@@ -928,38 +1094,68 @@ unsafe fn wait_for_presentation_time(
     stop: &AtomicBool,
     paused: &AtomicBool,
     activated: &AtomicBool,
-    clock_media: &mut Option<i64>,
-    clock_wall: &mut Option<Instant>,
+    playback_clock: &PlaybackClock,
+    timing: &mut PresentationClock,
     first_frame: bool,
-) {
-    if first_frame {
-        return;
-    }
+) -> bool {
     let sample_time = frame.GetSampleTime().unwrap_or(0);
-    let media_origin = *clock_media.get_or_insert(sample_time);
-    clock_wall.get_or_insert_with(Instant::now);
+    let media_origin = *timing.media_origin_100ns.get_or_insert(sample_time);
     let delta_100ns = sample_time.saturating_sub(media_origin).max(0) as u64;
-    let media_delta = Duration::from_nanos(delta_100ns.saturating_mul(100));
+    let sample_duration = frame.GetSampleDuration().unwrap_or(0).max(0) as u64;
+    timing.cycle_end_100ns = timing
+        .cycle_end_100ns
+        .max(delta_100ns.saturating_add(sample_duration));
+    if first_frame {
+        return true;
+    }
+
     while !stop.load(Ordering::Acquire) {
         if !activated.load(Ordering::Acquire) || paused.load(Ordering::Acquire) {
-            let waiting_started = Instant::now();
             while (!activated.load(Ordering::Acquire) || paused.load(Ordering::Acquire))
                 && !stop.load(Ordering::Acquire)
             {
                 thread::sleep(Duration::from_millis(5));
             }
-            if let Some(origin) = clock_wall.as_mut() {
-                *origin += waiting_started.elapsed();
-            }
+            timing.wall_media_anchor_100ns = delta_100ns;
+            timing.wall_origin = Instant::now();
             continue;
         }
-        let target = clock_wall.expect("playback clock initialized") + media_delta;
+
+        if let Some(audio_position_100ns) = playback_clock.snapshot() {
+            if !timing.was_audio_active {
+                timing.was_audio_active = true;
+            }
+            let target_100ns = timing.timeline_offset_100ns.saturating_add(delta_100ns);
+            if audio_position_100ns >= target_100ns {
+                // A frame more than 100 ms late is discarded so that video
+                // catches up instead of accumulating permanent A/V latency.
+                return audio_position_100ns.saturating_sub(target_100ns) <= 1_000_000;
+            }
+            let remaining_100ns = target_100ns - audio_position_100ns;
+            thread::sleep(
+                Duration::from_nanos(remaining_100ns.saturating_mul(100))
+                    .min(Duration::from_millis(5)),
+            );
+            continue;
+        }
+
+        if timing.was_audio_active {
+            // Native audio failed or moved to fallback. Anchor the wall clock
+            // at the current frame so video remains smooth and independent.
+            timing.was_audio_active = false;
+            timing.wall_media_anchor_100ns = delta_100ns;
+            timing.wall_origin = Instant::now();
+        }
+        let wall_delta_100ns = delta_100ns.saturating_sub(timing.wall_media_anchor_100ns);
+        let target =
+            timing.wall_origin + Duration::from_nanos(wall_delta_100ns.saturating_mul(100));
         if Instant::now() >= target {
-            break;
+            return true;
         }
         let remaining = target.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(Duration::from_millis(5)));
     }
+    false
 }
 
 /// Bounded end-to-end smoke test for the direct backend. It continuously
@@ -977,7 +1173,7 @@ pub fn run_native_mp4_smoke_test(
         let mut presenter = if skip_present {
             None
         } else {
-            Some(session.create_presenter(host)?)
+            Some(session.create_presenter(host, true)?)
         };
         let source = resolve_media_source(path)?;
         let descriptor = source

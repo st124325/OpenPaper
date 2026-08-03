@@ -40,6 +40,10 @@ internal static partial class WallpaperEngineInterop
     [return: MarshalAs(UnmanagedType.I1)]
     internal static partial bool SetPerformanceMode(int mode);
 
+    [LibraryImport(LibraryName, EntryPoint = "set_stretch_to_fill")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static partial bool SetStretchToFill([MarshalAs(UnmanagedType.I1)] bool enabled);
+
     [LibraryImport(LibraryName, EntryPoint = "get_last_error")]
     private static unsafe partial nuint GetLastError(byte* buffer, nuint capacity);
 

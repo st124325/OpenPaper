@@ -2,8 +2,11 @@
 //! Playback is provided by dynamically loaded libVLC (LGPL-2.1-or-later).
 
 mod direct_mft;
+mod media_event_queue;
 #[allow(dead_code)]
 mod mf_d3d11;
+mod native_audio;
+mod playback_clock;
 mod vlc;
 
 use std::{
@@ -12,7 +15,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -44,11 +47,14 @@ struct EngineState {
     automatically_muted: bool,
     volume: i32,
     performance_mode: i32,
+    stretch_to_fill: bool,
     d3d11_media_foundation_available: bool,
     native_mp4_diagnostic: String,
+    native_audio_diagnostic: String,
     last_error: String,
     player: Option<vlc::VlcPlayer>,
     native_renderer: Option<direct_mft::DirectMp4Renderer>,
+    native_audio: Option<native_audio::NativeAudioRenderer>,
     monitor_stop: AtomicBool,
     fullscreen_paused: AtomicBool,
     monitor: Option<JoinHandle<()>>,
@@ -66,11 +72,14 @@ fn engine() -> &'static Mutex<EngineState> {
             automatically_muted: false,
             volume: 100,
             performance_mode: 1,
+            stretch_to_fill: true,
             d3d11_media_foundation_available: false,
             native_mp4_diagnostic: String::new(),
+            native_audio_diagnostic: String::new(),
             last_error: String::new(),
             player: None,
             native_renderer: None,
+            native_audio: None,
             monitor_stop: AtomicBool::new(false),
             fullscreen_paused: AtomicBool::new(false),
             monitor: None,
@@ -235,12 +244,21 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
     if let Some(renderer) = state.native_renderer.take() {
         renderer.stop();
     }
+    if let Some(audio) = state.native_audio.take() {
+        audio.stop();
+    }
     let is_mp4 = Path::new(&path)
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("mp4"));
+    let playback_clock = Arc::new(playback_clock::PlaybackClock::new());
     let native_renderer = if is_mp4 && state.d3d11_media_foundation_available {
-        match direct_mft::DirectMp4Renderer::start(path.clone(), HWND(state.host_window as _)) {
+        match direct_mft::DirectMp4Renderer::start(
+            path.clone(),
+            HWND(state.host_window as _),
+            Arc::clone(&playback_clock),
+            state.stretch_to_fill,
+        ) {
             Ok(renderer) => {
                 state.native_mp4_diagnostic =
                     "Direct Media Foundation/DXVA renderer is active.".into();
@@ -261,33 +279,81 @@ pub extern "C" fn set_wallpaper(file_path: *const c_char) -> bool {
         };
         None
     };
-    let show_vlc_video = native_renderer.is_none();
-    let player = match unsafe {
-        vlc::VlcPlayer::start(
-            &path,
-            state.host_window as usize,
-            state.performance_mode,
-            show_vlc_video,
-        )
-    } {
-        Ok(player) => player,
-        Err(error) => {
-            if let Some(renderer) = native_renderer {
-                renderer.stop();
+    let effective_mute = state.muted || state.automatically_muted;
+    let native_audio = if native_renderer.is_some() {
+        match native_audio::NativeAudioRenderer::start(
+            path.clone(),
+            effective_mute,
+            state.volume,
+            Arc::clone(&playback_clock),
+        ) {
+            Ok(audio) => {
+                state.native_audio_diagnostic =
+                    "Native Media Foundation/WASAPI audio is active.".into();
+                Some(audio)
             }
-            state.last_error = error;
-            return false;
+            Err(error) => {
+                state.native_audio_diagnostic = format!(
+                    "Native audio preflight failed; libVLC audio fallback is active: {error}"
+                );
+                None
+            }
         }
+    } else {
+        state.native_audio_diagnostic = "libVLC owns audio for this wallpaper.".into();
+        None
+    };
+    let show_vlc_video = native_renderer.is_none();
+    let needs_vlc = show_vlc_video || native_audio.is_none();
+    let player = if needs_vlc {
+        match unsafe {
+            vlc::VlcPlayer::start(
+                &path,
+                state.host_window as usize,
+                state.performance_mode,
+                show_vlc_video,
+                state.stretch_to_fill,
+            )
+        } {
+            Ok(player) => Some(player),
+            Err(error) if native_renderer.is_some() => {
+                state.native_audio_diagnostic = format!(
+                    "Native audio and libVLC audio fallback both failed; video remains active: {error}"
+                );
+                None
+            }
+            Err(error) => {
+                if let Some(renderer) = native_renderer {
+                    renderer.stop();
+                }
+                if let Some(audio) = native_audio {
+                    audio.stop();
+                }
+                state.last_error = error;
+                return false;
+            }
+        }
+    } else {
+        None
     };
     state.active_media = Some(path);
-    unsafe { player.set_muted(state.muted || state.automatically_muted) };
-    unsafe { player.set_volume(state.volume) };
-    state.player = Some(player);
+    if let Some(player) = player.as_ref() {
+        unsafe {
+            player.set_muted(effective_mute);
+            player.set_volume(state.volume);
+        }
+    }
     if let Some(renderer) = native_renderer.as_ref() {
         renderer.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
         renderer.activate();
     }
+    if let Some(audio) = native_audio.as_ref() {
+        audio.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
+        audio.activate();
+    }
+    state.player = player;
     state.native_renderer = native_renderer;
+    state.native_audio = native_audio;
     state.last_error.clear();
     true
 }
@@ -304,7 +370,21 @@ pub extern "C" fn set_performance_mode(mode: i32) -> bool {
     true
 }
 
-/// Mutes or unmutes the currently running libVLC player.
+/// Controls scaling for the next playback start. `true` fills the complete
+/// desktop even when that changes the source aspect ratio; `false` preserves
+/// the source aspect ratio and leaves black bars where necessary.
+#[no_mangle]
+pub extern "C" fn set_stretch_to_fill(enabled: bool) -> bool {
+    let mut state = match engine().lock() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    state.stretch_to_fill = enabled;
+    state.last_error.clear();
+    true
+}
+
+/// Mutes or unmutes the active native or fallback audio session.
 #[no_mangle]
 pub extern "C" fn set_muted(muted: bool) -> bool {
     let mut state = match engine().lock() {
@@ -314,6 +394,9 @@ pub extern "C" fn set_muted(muted: bool) -> bool {
     state.muted = muted;
     if let Some(player) = state.player.as_ref() {
         unsafe { player.set_muted(state.muted || state.automatically_muted) };
+    }
+    if let Some(audio) = state.native_audio.as_ref() {
+        audio.set_muted(state.muted || state.automatically_muted);
     }
     state.last_error.clear();
     true
@@ -334,6 +417,9 @@ pub extern "C" fn set_mute_when_other_app_open(enabled: bool) -> bool {
     if let Some(player) = state.player.as_ref() {
         unsafe { player.set_muted(state.muted || state.automatically_muted) };
     }
+    if let Some(audio) = state.native_audio.as_ref() {
+        audio.set_muted(state.muted || state.automatically_muted);
+    }
     state.last_error.clear();
     true
 }
@@ -349,6 +435,9 @@ pub extern "C" fn set_volume(volume: i32) -> bool {
     state.volume = volume.clamp(0, 100);
     if let Some(player) = state.player.as_ref() {
         unsafe { player.set_volume(state.volume) };
+    }
+    if let Some(audio) = state.native_audio.as_ref() {
+        audio.set_volume(state.volume);
     }
     state.last_error.clear();
     true
@@ -390,6 +479,9 @@ pub extern "C" fn stop_engine() {
         }
         if let Some(renderer) = state.native_renderer.take() {
             renderer.stop();
+        }
+        if let Some(audio) = state.native_audio.take() {
+            audio.stop();
         }
         if state.host_window != 0 {
             unsafe {
@@ -791,6 +883,52 @@ pub extern "C" fn get_native_mp4_diagnostic(buffer: *mut c_char, capacity: usize
     bytes.len()
 }
 
+/// True only after native PCM has been submitted to the WASAPI endpoint.
+#[no_mangle]
+pub extern "C" fn is_native_audio_ready() -> bool {
+    engine()
+        .lock()
+        .map(|state| {
+            state
+                .native_audio
+                .as_ref()
+                .is_some_and(|audio| !audio.has_failed() && audio.frames_written() > 0)
+        })
+        .unwrap_or(false)
+}
+
+#[no_mangle]
+pub extern "C" fn get_native_audio_frame_count() -> u64 {
+    engine()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .native_audio
+                .as_ref()
+                .map(|audio| audio.frames_written())
+        })
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn get_native_audio_diagnostic(buffer: *mut c_char, capacity: usize) -> usize {
+    let message = engine()
+        .lock()
+        .map(|state| state.native_audio_diagnostic.clone())
+        .unwrap_or_else(|_| "Engine state lock failed.".into());
+    let bytes = message.as_bytes();
+    if !buffer.is_null() && capacity != 0 {
+        let count = bytes.len().min(capacity - 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), count);
+            *buffer.add(count) = 0;
+        }
+    }
+    bytes.len()
+}
+
 /// Clears the static wallpaper and paints the desktop background solid black.
 /// This is intentionally separate from `stop_engine`: exiting OpenPaper must
 /// not unexpectedly alter a user's desktop, while selecting "No wallpaper" does.
@@ -877,6 +1015,7 @@ fn fullscreen_monitor(core: &'static Mutex<EngineState>) {
         let other_app_open = unsafe { foreground_is_external_application() };
         if let Ok(mut state) = core.lock() {
             fallback_to_vlc_if_native_failed(&mut state);
+            fallback_audio_to_vlc_if_native_failed(&mut state);
             let was_paused = state.fullscreen_paused.swap(fullscreen, Ordering::AcqRel);
             if was_paused != fullscreen {
                 if let Some(player) = state.player.as_ref() {
@@ -887,12 +1026,18 @@ fn fullscreen_monitor(core: &'static Mutex<EngineState>) {
                 if let Some(renderer) = state.native_renderer.as_ref() {
                     renderer.set_paused(fullscreen);
                 }
+                if let Some(audio) = state.native_audio.as_ref() {
+                    audio.set_paused(fullscreen);
+                }
             }
             let automatic_mute = state.mute_when_other_app_open && other_app_open;
             if state.automatically_muted != automatic_mute {
                 state.automatically_muted = automatic_mute;
                 if let Some(player) = state.player.as_ref() {
                     unsafe { player.set_muted(state.muted || automatic_mute) };
+                }
+                if let Some(audio) = state.native_audio.as_ref() {
+                    audio.set_muted(state.muted || automatic_mute);
                 }
             }
         }
@@ -914,6 +1059,9 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
     if let Some(renderer) = state.native_renderer.take() {
         renderer.stop();
     }
+    if let Some(audio) = state.native_audio.take() {
+        audio.stop();
+    }
     if let Some(player) = state.player.take() {
         player.stop();
     }
@@ -928,6 +1076,7 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
             state.host_window as usize,
             state.performance_mode,
             true,
+            state.stretch_to_fill,
         )
     } {
         Ok(player) => {
@@ -944,6 +1093,54 @@ fn fallback_to_vlc_if_native_failed(state: &mut EngineState) {
         Err(error) => {
             state.last_error =
                 format!("Native renderer failed and libVLC fallback could not start: {error}")
+        }
+    }
+}
+
+/// A late WASAPI/device failure must not stop the native D3D11 video. Restore
+/// only libVLC audio and leave the direct video renderer running.
+fn fallback_audio_to_vlc_if_native_failed(state: &mut EngineState) {
+    let audio_failed = state
+        .native_audio
+        .as_ref()
+        .is_some_and(|audio| audio.has_failed());
+    if !audio_failed {
+        return;
+    }
+    if let Some(audio) = state.native_audio.take() {
+        audio.stop();
+    }
+    if state.player.is_some() {
+        return;
+    }
+    let Some(path) = state.active_media.as_deref() else {
+        state.last_error =
+            "Native audio stopped and no wallpaper path is available for fallback.".into();
+        return;
+    };
+    match unsafe {
+        vlc::VlcPlayer::start(
+            path,
+            state.host_window as usize,
+            state.performance_mode,
+            false,
+            state.stretch_to_fill,
+        )
+    } {
+        Ok(player) => {
+            unsafe {
+                player.set_muted(state.muted || state.automatically_muted);
+                player.set_volume(state.volume);
+                player.set_paused(state.fullscreen_paused.load(Ordering::Acquire));
+            }
+            state.player = Some(player);
+            state.native_audio_diagnostic =
+                "Native audio failed during playback; libVLC audio fallback is active.".into();
+            state.last_error.clear();
+        }
+        Err(error) => {
+            state.last_error =
+                format!("Native audio failed and libVLC audio fallback could not start: {error}")
         }
     }
 }

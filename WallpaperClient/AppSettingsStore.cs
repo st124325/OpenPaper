@@ -12,9 +12,13 @@ internal sealed class AppSettingsStore
         try
         {
             var source = File.Exists(SettingsPath) ? SettingsPath : LegacySettingsPath;
-            return File.Exists(source)
-                ? JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(source)) ?? new AppSettings()
-                : new AppSettings();
+            if (!File.Exists(source)) return new AppSettings();
+            var json = File.ReadAllText(source);
+            var settings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+            using var document = JsonDocument.Parse(json);
+            return document.RootElement.TryGetProperty(nameof(AppSettings.StretchToFill), out _)
+                ? settings
+                : settings with { StretchToFill = true };
         }
         catch (JsonException) { return new AppSettings(); }
     }
@@ -33,4 +37,5 @@ internal sealed record AppSettings(
     int Volume = 100,
     Dictionary<string, string>? LibraryTitles = null,
     bool MuteWhenOtherAppOpen = false,
-    int PerformanceMode = 1);
+    int PerformanceMode = 1,
+    bool StretchToFill = true);

@@ -1,26 +1,48 @@
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Threading;
 
 namespace WallpaperClient;
 
 public partial class MainWindow : Window
 {
+    private static readonly SolidColorBrush ActiveAudioBrush = CreateFrozenBrush(20, 20, 20);
+    private static readonly SolidColorBrush MutedAudioBrush = CreateFrozenBrush(220, 224, 228);
     private readonly AppSettingsStore _settingsStore = new();
+    private readonly ObservableCollection<WallpaperCard> _wallpaperCards = [];
+    private readonly DispatcherTimer _volumeSaveTimer = new() { Interval = TimeSpan.FromMilliseconds(350) };
+    private readonly DispatcherTimer _previewTimer = new() { Interval = TimeSpan.FromMilliseconds(450) };
+    private readonly DispatcherTimer _previewRevealTimer = new() { Interval = TimeSpan.FromMilliseconds(120) };
     private AppSettings _settings = new();
     private bool _loading;
     private bool _muted;
     private bool _syncingVolume;
+    private bool _syncingLibrarySelection;
+    private bool _volumeSettingsPending;
     private int _lastVolume = 70;
     private string? _availableUpdateVersion;
+    private WallpaperCard? _previewCard;
+    private string? _previewPath;
+    private Border? _previewTarget;
 
     public MainWindow()
     {
         InitializeComponent();
+        LibraryCards.ItemsSource = _wallpaperCards;
+        _volumeSaveTimer.Tick += VolumeSaveTimer_Tick;
+        _previewTimer.Tick += PreviewTimer_Tick;
+        _previewRevealTimer.Tick += PreviewRevealTimer_Tick;
         Loaded += async (_, _) => await UpdateChecker.CheckAsync(this);
-        Closed += (_, _) => UpdateChecker.UpdateReady -= UpdateReady;
+        Closed += (_, _) =>
+        {
+            UpdateChecker.UpdateReady -= UpdateReady;
+            StopPreview();
+            FlushVolumeSettings();
+        };
         UpdateChecker.UpdateReady += UpdateReady;
         LibraryPanel.Visibility = Visibility.Visible;
         SettingsPanel.Visibility = Visibility.Collapsed;
@@ -28,10 +50,11 @@ public partial class MainWindow : Window
         _settings = _settingsStore.Load();
         AutoStartCheckBox.IsChecked = _settings.StartWithWindows;
         OtherAppsMuteCheckBox.IsChecked = _settings.MuteWhenOtherAppOpen;
+        StretchToFillCheckBox.IsChecked = _settings.StretchToFill;
         VolumeSlider.Value = Math.Clamp(_settings.Volume, 0, 100);
         _muted = VolumeSlider.Value == 0;
         _lastVolume = _muted ? 70 : (int)VolumeSlider.Value;
-        RefreshLibrary(_settings.WallpaperPath);
+        SyncLibrary(_settings.WallpaperPath, updateSelection: true);
         ApplyLanguage();
         _loading = false;
 
@@ -39,12 +62,20 @@ public partial class MainWindow : Window
         WallpaperEngineInterop.SetVolume((int)VolumeSlider.Value);
         WallpaperEngineInterop.SetMuteWhenOtherAppOpen(_settings.MuteWhenOtherAppOpen);
         WallpaperEngineInterop.SetPerformanceMode(_settings.PerformanceMode);
+        WallpaperEngineInterop.SetStretchToFill(_settings.StretchToFill);
         if (!string.IsNullOrWhiteSpace(_settings.WallpaperPath) && File.Exists(_settings.WallpaperPath)) ApplyWallpaper(_settings.WallpaperPath!, false);
         else SetStatus("Engine ready. Upload a wallpaper to start.", "Движок готов. Загрузите обои, чтобы начать.");
     }
 
     private bool IsRussian => _settings.Language != "en";
     private string T(string en, string ru) => IsRussian ? ru : en;
+    private static SolidColorBrush CreateFrozenBrush(byte red, byte green, byte blue)
+    {
+        var brush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(red, green, blue));
+        brush.Freeze();
+        return brush;
+    }
+
     private void SetStatus(string en, string ru)
     {
         if (en == "Language updated.") return;
@@ -63,17 +94,10 @@ public partial class MainWindow : Window
         AutoStartLabelText.Text = T("Start with Windows", "Запускать вместе с Windows");
         OtherAppsMuteLabelText.Text = T("Mute wallpaper when another app is active", "Отключать звук обоев при открытом приложении");
         PerformanceLabelText.Text = T("Performance", "Производительность");
+        StretchToFillLabelText.Text = T("Stretch wallpaper to fill the screen", "Растягивать обои на весь экран");
         VersionLabelText.Text = T("Installed version", "Текущая версия");
         VersionValueText.Text = $"v{typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"}";
-        MuteButton.ToolTip = T(_muted ? "Turn sound on" : "Turn sound off", _muted ? "Включить звук" : "Выключить звук");
-        MuteButton.Background = _muted
-            ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 224, 228))
-            : new SolidColorBrush(System.Windows.Media.Color.FromRgb(20, 20, 20));
-        MuteButton.Foreground = _muted ? System.Windows.Media.Brushes.Black : System.Windows.Media.Brushes.White;
-        AudioIconText.Text = _muted || VolumeSlider.Value == 0
-            ? "🔇"
-            : VolumeSlider.Value < 50 ? "🔉" : "🔊";
-        VolumeValueText.Text = $"{(int)VolumeSlider.Value}%";
+        UpdateAudioUi();
         UpdateLanguagePill();
         UpdateBannerText.Text = _availableUpdateVersion is null
             ? string.Empty
@@ -88,9 +112,19 @@ public partial class MainWindow : Window
         RuButton.Foreground = IsRussian ? System.Windows.Media.Brushes.White : System.Windows.Media.Brushes.Black;
         EnButton.Background = IsRussian ? System.Windows.Media.Brushes.Transparent : active;
         EnButton.Foreground = IsRussian ? System.Windows.Media.Brushes.Black : System.Windows.Media.Brushes.White;
-        AudioWavePath.Visibility = _muted || VolumeSlider.Value == 0 ? Visibility.Collapsed : Visibility.Visible;
-        AudioMuteSlashPath.Visibility = _muted || VolumeSlider.Value == 0 ? Visibility.Visible : Visibility.Collapsed;
         UpdatePerformancePill();
+    }
+
+    private void UpdateAudioUi()
+    {
+        var muted = _muted || VolumeSlider.Value <= 0;
+        MuteButton.ToolTip = T(muted ? "Turn sound on" : "Turn sound off", muted ? "Включить звук" : "Выключить звук");
+        MuteButton.Background = muted ? MutedAudioBrush : ActiveAudioBrush;
+        MuteButton.Foreground = muted ? System.Windows.Media.Brushes.Black : System.Windows.Media.Brushes.White;
+        AudioWavePath.Visibility = muted ? Visibility.Collapsed : Visibility.Visible;
+        AudioMuteSlashPath.Visibility = muted ? Visibility.Visible : Visibility.Collapsed;
+        AudioIconText.Text = muted ? "🔇" : VolumeSlider.Value < 50 ? "🔉" : "🔊";
+        VolumeValueText.Text = $"{(int)VolumeSlider.Value}%";
     }
 
     private void UpdatePerformancePill()
@@ -156,7 +190,15 @@ public partial class MainWindow : Window
     }
     private void Russian_Click(object sender, RoutedEventArgs e) => ChangeLanguage("ru");
     private void English_Click(object sender, RoutedEventArgs e) => ChangeLanguage("en");
-    private void ChangeLanguage(string language) { _settings = _settings with { Language = language }; _settingsStore.Save(_settings); ApplyLanguage(); SetStatus("Language updated.", "Язык обновлён."); }
+    private void ChangeLanguage(string language)
+    {
+        _settings = _settings with { Language = language };
+        _settingsStore.Save(_settings);
+        if (_wallpaperCards.Count > 0 && _wallpaperCards[0].IsEmpty)
+            _wallpaperCards[0].UpdateTitle(T("No wallpaper", "Без обоев"));
+        ApplyLanguage();
+        SetStatus("Language updated.", "Язык обновлён.");
+    }
 
     private void AddLibrary_Click(object sender, RoutedEventArgs e)
     {
@@ -170,13 +212,13 @@ public partial class MainWindow : Window
         var titles = GetTitles();
         titles[path] = nameDialog.WallpaperTitle;
         SaveLibrary(library, titles);
-        RefreshLibrary(path);
+        SyncLibrary(null, updateSelection: false);
         SetStatus("Wallpaper uploaded. Click its card to apply it.", "Обои загружены. Нажмите на их карточку, чтобы применить.");
     }
 
     private void LibraryCardsSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_loading || LibraryCards.SelectedItem is not WallpaperCard card) return;
+        if (_loading || _syncingLibrarySelection || LibraryCards.SelectedItem is not WallpaperCard card) return;
         if (card.IsEmpty)
         {
             WallpaperEngineInterop.StopEngine();
@@ -203,42 +245,71 @@ public partial class MainWindow : Window
     private void CardPreviewEnter(object sender, System.Windows.Input.MouseEventArgs e)
     {
         if (sender is not Border card || card.DataContext is not WallpaperCard item || !item.IsVideo) return;
-        var player = FindChild<MediaElement>(card);
-        if (player is not null)
+        StopPreview();
+        _previewCard = item;
+        _previewPath = item.Path;
+        _previewTarget = card;
+        PreviewHost.Visibility = Visibility.Collapsed;
+        PreviewPlayer.Source = new Uri(item.Path!, UriKind.Absolute);
+        PreviewPlayer.Position = TimeSpan.Zero;
+        PreviewPlayer.Play();
+    }
+
+    private void CardPreviewMediaOpened(object sender, RoutedEventArgs e)
+    {
+        if (_previewTarget is null || _previewPath is null) return;
+        _previewRevealTimer.Stop();
+        _previewRevealTimer.Start();
+        if (_previewCard?.ThumbnailUri is null && _previewPath is not null)
         {
-            player.Position = TimeSpan.Zero; player.Play();
-            if (item.ThumbnailUri is null)
-            {
-                var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
-                timer.Tick += (_, _) =>
-                {
-                    timer.Stop();
-                    if (ThumbnailCache.Save(player, item.Path!)) RefreshLibrary(item.Path);
-                };
-                timer.Start();
-            }
+            _previewTimer.Stop();
+            _previewTimer.Start();
         }
     }
+
+    private void PreviewRevealTimer_Tick(object? sender, EventArgs e)
+    {
+        _previewRevealTimer.Stop();
+        var target = _previewTarget;
+        if (target is null || _previewPath is null) return;
+        var position = target.TranslatePoint(new System.Windows.Point(0, 0), PreviewOverlay);
+        Canvas.SetLeft(PreviewHost, position.X);
+        Canvas.SetTop(PreviewHost, position.Y);
+        PreviewHost.Visibility = Visibility.Visible;
+    }
+
+    private void PreviewTimer_Tick(object? sender, EventArgs e)
+    {
+        _previewTimer.Stop();
+        var card = _previewCard;
+        var path = _previewPath;
+        if (_previewTarget is null || card is null || path is null || card.Path != path) return;
+        if (PreviewPlayer.ActualWidth > 0 && PreviewPlayer.ActualHeight > 0 && ThumbnailCache.Save(PreviewPlayer, path))
+            card.RefreshThumbnail();
+    }
+
     private void CardPreviewLeave(object sender, System.Windows.Input.MouseEventArgs e)
     {
-        if (sender is not Border card) return;
-        var player = FindChild<MediaElement>(card);
-        if (player is not null) { player.Stop(); player.Position = TimeSpan.Zero; }
+        if (sender is Border card && ReferenceEquals(_previewTarget, card)) StopPreview();
     }
+
     private void CardPreviewEnded(object sender, RoutedEventArgs e)
     {
-        if (sender is MediaElement player) { player.Position = TimeSpan.Zero; player.Play(); }
+        if (_previewTarget is null) return;
+        PreviewPlayer.Position = TimeSpan.Zero;
+        PreviewPlayer.Play();
     }
-    private static TChild? FindChild<TChild>(DependencyObject root) where TChild : DependencyObject
+
+    private void StopPreview()
     {
-        for (var i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
-        {
-            var child = VisualTreeHelper.GetChild(root, i);
-            if (child is TChild match) return match;
-            var nested = FindChild<TChild>(child);
-            if (nested is not null) return nested;
-        }
-        return null;
+        _previewTimer.Stop();
+        _previewRevealTimer.Stop();
+        PreviewPlayer.Stop();
+        PreviewPlayer.Source = null;
+        PreviewHost.Visibility = Visibility.Collapsed;
+        _previewCard = null;
+        _previewPath = null;
+        _previewTarget = null;
     }
 
     private List<string> GetLibrary() => (_settings.Library ?? []).Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
@@ -248,27 +319,82 @@ public partial class MainWindow : Window
         _settings = _settings with { Library = library, LibraryTitles = titles ?? GetTitles() };
         _settingsStore.Save(_settings);
     }
-    private void RefreshLibrary(string? selectPath = null)
+    private void SyncLibrary(string? selectPath, bool updateSelection)
     {
         var titles = GetTitles();
-        var cards = new List<WallpaperCard> { WallpaperCard.Empty(T("No wallpaper", "Без обоев")) };
-        cards.AddRange(GetLibrary().Select(path => new WallpaperCard(path, titles.GetValueOrDefault(path, Path.GetFileNameWithoutExtension(path)))));
-        LibraryCards.ItemsSource = cards;
-        EmptyLibraryText.Visibility = cards.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        var wanted = selectPath ?? _settings.WallpaperPath;
-        LibraryCards.SelectedItem = cards.FirstOrDefault(card => string.Equals(card.Path, wanted, StringComparison.OrdinalIgnoreCase)) ?? cards[0];
+        var paths = GetLibrary();
+
+        if (_wallpaperCards.Count == 0 || !_wallpaperCards[0].IsEmpty)
+            _wallpaperCards.Insert(0, WallpaperCard.Empty(T("No wallpaper", "Без обоев")));
+        else
+            _wallpaperCards[0].UpdateTitle(T("No wallpaper", "Без обоев"));
+
+        var wantedPaths = new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase);
+        for (var index = _wallpaperCards.Count - 1; index >= 1; index--)
+        {
+            var path = _wallpaperCards[index].Path;
+            if (path is null || !wantedPaths.Contains(path)) _wallpaperCards.RemoveAt(index);
+        }
+
+        var cardsByPath = _wallpaperCards
+            .Skip(1)
+            .Where(card => card.Path is not null)
+            .ToDictionary(card => card.Path!, StringComparer.OrdinalIgnoreCase);
+        foreach (var path in paths)
+        {
+            var title = titles.GetValueOrDefault(path, Path.GetFileNameWithoutExtension(path));
+            if (!cardsByPath.TryGetValue(path, out var existing))
+                _wallpaperCards.Add(new WallpaperCard(path, title));
+            else
+                existing.UpdateTitle(title);
+        }
+
+        EmptyLibraryText.Visibility = paths.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        if (!updateSelection) return;
+
+        _syncingLibrarySelection = true;
+        try
+        {
+            LibraryCards.SelectedItem = _wallpaperCards.FirstOrDefault(card =>
+                string.Equals(card.Path, selectPath, StringComparison.OrdinalIgnoreCase)) ?? _wallpaperCards[0];
+        }
+        finally
+        {
+            _syncingLibrarySelection = false;
+        }
     }
 
     private void VolumeChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
-        VolumeValueText.Text = ((int)e.NewValue).ToString();
+        VolumeValueText.Text = $"{(int)e.NewValue}%";
         if (_loading || _syncingVolume) return;
         var volume = (int)e.NewValue;
         if (volume == 0) _muted = true;
         else { _muted = false; _lastVolume = volume; }
         WallpaperEngineInterop.SetMuted(_muted);
-        if (WallpaperEngineInterop.SetVolume(volume)) { _settings = _settings with { Volume = volume }; _settingsStore.Save(_settings); }
-        ApplyLanguage();
+        if (WallpaperEngineInterop.SetVolume(volume))
+        {
+            _settings = _settings with { Volume = volume };
+            ScheduleVolumeSettingsSave();
+        }
+        UpdateAudioUi();
+    }
+
+    private void ScheduleVolumeSettingsSave()
+    {
+        _volumeSettingsPending = true;
+        _volumeSaveTimer.Stop();
+        _volumeSaveTimer.Start();
+    }
+
+    private void VolumeSaveTimer_Tick(object? sender, EventArgs e) => FlushVolumeSettings();
+
+    private void FlushVolumeSettings()
+    {
+        _volumeSaveTimer.Stop();
+        if (!_volumeSettingsPending) return;
+        _volumeSettingsPending = false;
+        _settingsStore.Save(_settings);
     }
     private void Mute_Click(object sender, RoutedEventArgs e)
     {
@@ -303,23 +429,70 @@ public partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(_settings.WallpaperPath) && File.Exists(_settings.WallpaperPath))
             ApplyWallpaper(_settings.WallpaperPath, false);
     }
+    private void StretchToFillChanged(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+        var enabled = StretchToFillCheckBox.IsChecked == true;
+        if (!WallpaperEngineInterop.SetStretchToFill(enabled)) return;
+        _settings = _settings with { StretchToFill = enabled };
+        _settingsStore.Save(_settings);
+        if (!string.IsNullOrWhiteSpace(_settings.WallpaperPath) && File.Exists(_settings.WallpaperPath))
+            ApplyWallpaper(_settings.WallpaperPath, false);
+    }
     private void AutoStartChanged(object sender, RoutedEventArgs e)
     {
         if (_loading) return;
         try { var enabled = AutoStartCheckBox.IsChecked == true; WindowsStartup.SetEnabled(enabled); _settings = _settings with { StartWithWindows = enabled }; _settingsStore.Save(_settings); }
         catch (System.Security.SecurityException) { SetStatus("Windows denied the startup setting.", "Windows отклонила настройку автозапуска."); }
     }
-    protected override void OnClosing(CancelEventArgs e) { if (!((App)System.Windows.Application.Current).IsExiting) { e.Cancel = true; Hide(); } base.OnClosing(e); }
-
-    private sealed record WallpaperCard(string? Path, string Title)
+    protected override void OnClosing(CancelEventArgs e)
     {
+        FlushVolumeSettings();
+        StopPreview();
+        if (!((App)System.Windows.Application.Current).IsExiting)
+        {
+            e.Cancel = true;
+            Hide();
+        }
+        base.OnClosing(e);
+    }
+
+    private sealed class WallpaperCard : INotifyPropertyChanged
+    {
+        private string _title;
+        private Uri? _thumbnailUri;
+
+        public WallpaperCard(string? path, string title)
+        {
+            Path = path;
+            _title = title;
+            _thumbnailUri = ThumbnailCache.Get(path);
+        }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+        public string? Path { get; }
+        public string Title => _title;
         public static WallpaperCard Empty(string title) => new(null, title);
         public bool IsEmpty => Path is null;
         public string FileName => Path is null ? "Windows" : System.IO.Path.GetFileName(Path);
         public string Extension => Path is null ? "OFF" : System.IO.Path.GetExtension(Path).TrimStart('.').ToUpperInvariant();
-        public Uri? PreviewUri => Path is null ? null : new Uri(Path, UriKind.Absolute);
-        public Uri? ThumbnailUri => ThumbnailCache.Get(Path);
+        public Uri? ThumbnailUri => _thumbnailUri;
         public string PreviewSymbol => Path is null ? "×" : "▶";
         public bool IsVideo => string.Equals(Extension, "MP4", StringComparison.OrdinalIgnoreCase);
+
+        public void UpdateTitle(string title)
+        {
+            if (_title == title) return;
+            _title = title;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Title)));
+        }
+
+        public void RefreshThumbnail()
+        {
+            var thumbnail = ThumbnailCache.Get(Path);
+            if (Equals(_thumbnailUri, thumbnail)) return;
+            _thumbnailUri = thumbnail;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ThumbnailUri)));
+        }
     }
 }
